@@ -246,6 +246,65 @@ class NLPDDPStrategy(DDPStrategy):
             return super(NLPDDPStrategy, self).distributed_sampler_kwargs
 
 
+class LayerUnitTestStrategy(NLPDDPStrategy):
+    def __init__(
+        self,
+        parallel_devices: Optional[List[torch.device]] = None,
+        cluster_environment: ClusterEnvironment = None,
+        checkpoint_io: Optional[CheckpointIO] = None,
+        no_ddp_communication_hook: bool = False,
+        parallelization_specs: dict = None,
+        **kwargs: Union[Any, Dict[str, Any]],
+    ) -> None:
+        super().__init__(parallel_devices, cluster_environment, checkpoint_io, **kwargs)
+        self.check_parallelization_specs(parallelization_specs)
+        self.parallelization_specs = parallelization_specs
+
+    def init_model_parallel(self, global_rank: int, world_size: int) -> None:
+        """ Initializes Megatron-LM model parallel if using model parallelism.
+
+        Args:
+            global_rank (int): the global process index.
+            world_size (int): the total number of GPUs, num_nodes * num_devices
+            is_slurm_managing_tasks (bool, optional): is the cluster managed by SLURM.
+        """
+        app_state = AppState()
+
+        # we initialize megatron-lm model parallel and data parallel groups
+        # after initializing DDP with PTL.
+        if app_state.model_parallel_size is not None:
+            # destroy groups in case they have already been created
+            # this happens with multiple calls to trainer.test for example
+            parallel_state.destroy_model_parallel()
+            if torch.distributed.is_initialized():
+                parallel_state.initialize_model_components_parallel(
+                    self.parallelization_specs
+                )
+
+                # assert that fake tp and pp rank match after model parallel init
+                assert app_state.tensor_model_parallel_rank == parallel_state.get_tensor_model_parallel_rank()
+                assert app_state.pipeline_model_parallel_rank == parallel_state.get_pipeline_model_parallel_rank()
+
+                app_state.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
+                app_state.data_parallel_group = parallel_state.get_data_parallel_group()
+                app_state.data_parallel_rank = parallel_state.get_data_parallel_rank()
+                app_state.data_parallel_size = parallel_state.get_data_parallel_world_size()
+                app_state.pipeline_model_parallel_group = parallel_state.get_pipeline_model_parallel_group()
+
+    def check_parallelization_specs(self, parallelization_specs: dict) -> None:
+        assert "stimulus" in parallelization_specs
+        assert "test" in parallelization_specs
+        assert "response" in parallelization_specs
+
+        for key in parallelization_specs:
+            assert "layers" in parallelization_specs[key]
+            assert "gpu_ranks" in parallelization_specs[key]
+            assert "gpus_per_node" in parallelization_specs[key]
+            assert "data_parallel_group_size" in parallelization_specs[key]
+            assert "tensor_model_parallel_group_size" in parallelization_specs[key]
+            assert "pipeline_model_parallel_group_size" in parallelization_specs[key]
+            assert "micro_batch_size" in parallelization_specs[key]
+
 class NLPSaveRestoreConnector(SaveRestoreConnector):
     def __init__(self) -> None:
         if not HAVE_APEX:
