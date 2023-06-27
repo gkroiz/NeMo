@@ -89,8 +89,12 @@ def main(cfg) -> None:
 
         model = MegatronGPTModel(cfg.model, trainer)
         i = 0
+        print('printing model')
+        print('model: ' + str(model))
+        for name, param in model.named_parameters():
+            print(f'{name}: {param.nelement()}')
         # for module in model.model:
-        #     logging.info(f"XXXXXXXXXXXX module {i}: {module}")
+            # logging.info(f"XXXXXXXXXXXX module {i}: {module}")
         j = 0
         logging.info(f"ZZZZZZZZZZZZ {model.model._language_model_key}")
         logging.info(f"XXXXXXXXXXXX {model.model.language_model}")
