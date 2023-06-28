@@ -103,9 +103,12 @@ def main(cfg) -> None:
             j += 1
             # i += 1
 
-
+        import time
+        s = time.time()
         trainer.fit(model)
-
+        e = time.time()
+        print(f'Train time: {e-s}s')
+        print(f'Train time: {(e-s):.2f}s')
 
 if __name__ == '__main__':
     main()
