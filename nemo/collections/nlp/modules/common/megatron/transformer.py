@@ -924,7 +924,11 @@ class ParallelTransformer(MegatronModule):
         num_moe_experts=1,
         moe_frequency=1,
         moe_dropout=0.0,
+        parallelization_specs=None,
     ):
+        assert parallelization_specs is not None
+        self.parallelization_specs = parallelization_specs
+
         super(ParallelTransformer, self).__init__()
 
         if kv_channels is None:
@@ -1022,14 +1026,14 @@ class ParallelTransformer(MegatronModule):
         )  # transformer engine forward allows for more granular selective checkpointing
 
         if self.model_type == ModelType.encoder_or_decoder:
-            assert (
-                num_layers % parallel_state.get_pipeline_model_parallel_world_size() == 0
-            ), 'num_layers must be divisible by pipeline_model_parallel_size'
+            assert (num_layers == sum(len(parallelization_specs[k]['layers']) for k in parallelization_specs))
+            for k in parallelization_specs:
+                assert (len(parallelization_specs[k]['layers']) % parallelization_specs[k]['pipeline_model_parallel_group_size'] == 0)
 
         assert moe_frequency <= num_layers, 'MoE frequency must be <= number of transformer layers'
         # TODO: Add similar assert for encoder-decoder.
 
-        self.num_layers = self.get_num_layers(num_layers)
+        self.num_layers = parallel_state.get_num_component_layers() // parallel_state.get_pipeline_component_parallel_world_size()
         # Transformer layers.
         def build_layer(layer_number):
             if isinstance(layer_type, list):
@@ -1106,11 +1110,14 @@ class ParallelTransformer(MegatronModule):
                     moe_dropout=moe_dropout,
                 )
 
+        # TODO: implement offset calculation for virtual pipeline model parallelism
+        assert parallel_state.get_virtual_pipeline_model_parallel_world_size() is None, (
+            'offset calculation has not been implmented with virtual pipeline model parallelism'
+        )
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             assert num_layers % parallel_state.get_virtual_pipeline_model_parallel_world_size() == 0, (
                 'num_layers_per_stage must be divisible by ' 'virtual_pipeline_model_parallel_size'
             )
-
             assert self.model_type.value != 2, f'virtual pipeline parallel currently only supported for GPT'
 
             # Number of layers in each model chunk is the number of layers in the stage,
@@ -1124,25 +1131,30 @@ class ParallelTransformer(MegatronModule):
             # layers to stages like (each list is a model chunk):
             # Stage 0: [0, 1]  [4, 5]
             # Stage 1: [2, 3]  [6, 7]
+            # NOTE: get_pipeline_component_parallel_rank() -> component of model
             offset = parallel_state.get_virtual_pipeline_model_parallel_rank() * (
                 num_layers // parallel_state.get_virtual_pipeline_model_parallel_world_size()
-            ) + (parallel_state.get_pipeline_model_parallel_rank() * self.num_layers)
+            ) + (parallel_state.get_pipeline_component_parallel_rank() * self.num_layers)
         else:
             # Each stage gets a contiguous set of layers.
+            # NOTE: get_pipeline_model_parallel_world_size() -> entire model
             if (
                 self.model_type == ModelType.encoder_and_decoder
                 and parallel_state.get_pipeline_model_parallel_world_size() > 1
             ):
+                # NOTE: get_pipeline_model_parallel_rank() -> entire model
                 pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
                 if layer_type == LayerType.encoder:
-                    offset = pipeline_rank * self.num_layers
+                    offset = self.get_offset(parallel_state.get_pipeline_model_parallel_rank())
                 else:
+                    # TODO: check the logic here
                     num_ranks_in_enc = parallel_state.get_pipeline_model_parallel_split_rank()
-                    offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
+                    offset = self.get_offset(pipeline_rank - num_ranks_in_enc)
             else:
-                offset = parallel_state.get_pipeline_model_parallel_rank() * self.num_layers
-
+                offset = self.get_offset(parallel_state.get_pipeline_model_parallel_rank())
         # TODO TODO TODO(crankshaw): This is where the layers for a specific device get built
+        for i in range(self.num_layers):
+            print(f'layer {i + 1 + offset}')
         self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
         if self.post_process and self.transformer_block_type != 'post_ln':
@@ -1161,35 +1173,26 @@ class ParallelTransformer(MegatronModule):
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
 
-    def get_num_layers(self, num_layers):
-        """Compute the number of transformer layers resident on the current rank."""
-        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
-            if self.model_type == ModelType.encoder_and_decoder:
-                assert parallel_state.get_pipeline_model_parallel_split_rank() is not None
-                num_ranks_in_encoder = parallel_state.get_pipeline_model_parallel_split_rank()
-                num_ranks_in_decoder = parallel_state.get_pipeline_model_parallel_world_size() - num_ranks_in_encoder
-                if self.layer_type == LayerType.encoder:
-                    assert (
-                        num_layers % num_ranks_in_encoder == 0
-                    ), 'num_layers must be divisible by number of ranks given to encoder'
-                elif self.layer_type == LayerType.decoder:
-                    assert (
-                        num_layers % num_ranks_in_decoder == 0
-                    ), 'num_layers must be divisible by number of ranks given to decoder'
-                else:
-                    raise ValueError(f"Unknown layer type {self.layer_type}")
+    def get_offset(self, pipeline_model_rank):
+        """Compute offset count"""
+        offset = 0
+        pipeline_model_rank_tracker = 0
+        component_tracker = 0
+        while pipeline_model_rank > pipeline_model_rank_tracker:
+            component_name = list(self.parallelization_specs.keys())[component_tracker]
+            component_num_layers = len(self.parallelization_specs[component_name]['layers'])
+            pipeline_component_parallel_group_size = self.parallelization_specs[component_name]['pipeline_model_parallel_group_size']
+            assert (
+                        component_num_layers % pipeline_component_parallel_group_size == 0
+                    ), 'component_num_layers must be divisible by pipeline_component_parallel_group_size'
+            for pipeline_component_parallel_group_rank in range(pipeline_component_parallel_group_size):
+                if pipeline_model_rank_tracker < pipeline_model_rank:
+                    offset += component_num_layers // pipeline_component_parallel_group_size
+                pipeline_model_rank_tracker += 1
 
-                if parallel_state.is_pipeline_stage_before_split():
-                    num_layers = num_layers // num_ranks_in_encoder
-                else:
-                    num_layers = num_layers // num_ranks_in_decoder
-            elif self.model_type == ModelType.encoder_or_decoder:
-                assert (
-                    num_layers % parallel_state.get_pipeline_model_parallel_world_size() == 0
-                ), 'num_layers must be divisible by pipeline_model_parallel_size'
-                num_layers = num_layers // parallel_state.get_pipeline_model_parallel_world_size()
 
-        return num_layers
+            component_tracker += 1
+        return offset
 
     def _checkpointed_forward(
         self,
@@ -1321,6 +1324,7 @@ class ParallelTransformer(MegatronModule):
                     and self.activations_checkpoint_layers_per_pipeline is not None
                 ):
                     # Decrease the number of layers to checkpoint at later pipeline stages
+                    # NOTE: get_pipeline_component_parallel_rank() -> component of model
                     activations_checkpoint_num_layers -= int(
                         parallel_state.get_pipeline_model_parallel_rank()
                         * self.activations_checkpoint_layers_per_pipeline

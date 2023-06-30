@@ -116,7 +116,9 @@ def get_language_model(
     fp8_amax_compute_algo='most_recent',
     reduce_amax=True,
     use_emha=False,
+    parallelization_specs=None,
 ):
+    assert parallelization_specs is not None
     """Build language model and return along with the key to save."""
 
     if kv_channels is None:
@@ -191,6 +193,7 @@ def get_language_model(
         fp8_amax_compute_algo=fp8_amax_compute_algo,
         reduce_amax=reduce_amax,
         use_emha=use_emha,
+        parallelization_specs=parallelization_specs,
     )
     # key used for checkpoints.
     language_model_key = 'language_model'
@@ -497,7 +500,10 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
         fp8_amax_compute_algo='most_recent',
         reduce_amax=True,
         use_emha=False,
+        parallelization_specs=None
     ):
+        assert parallelization_specs is not None
+
         super(TransformerLanguageModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
         self.pre_process = pre_process
@@ -602,6 +608,7 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
             fp8_amax_compute_algo=fp8_amax_compute_algo,
             reduce_amax=reduce_amax,
             use_emha=use_emha,
+            parallelization_specs=parallelization_specs,
         )
         self._encoder_key = 'encoder'
 
@@ -642,6 +649,7 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
                 activations_checkpoint_granularity=activations_checkpoint_granularity,
                 activations_checkpoint_layers_per_pipeline=activations_checkpoint_layers_per_pipeline,
                 transformer_engine=transformer_engine,
+                parallelization_specs=parallelization_specs,
             )
             self._decoder_key = 'decoder'
 

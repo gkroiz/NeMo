@@ -676,6 +676,7 @@ def _build_index_mappings(
     counts = torch.cuda.LongTensor([1])
     torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
     torch.distributed.all_reduce(counts, group=parallel_state.get_pipeline_model_parallel_group())
+    # TODO (gersonkroiz) comment out this check for now, we would want to count all tensor_model_parallel_groups for all ranks and then divide world size by that number
     assert counts[0].item() == (
         torch.distributed.get_world_size()
         // torch.distributed.get_world_size(group=parallel_state.get_tensor_model_parallel_group())

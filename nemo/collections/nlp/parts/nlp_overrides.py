@@ -131,11 +131,8 @@ class NLPDDPStrategy(DDPStrategy):
                 # TODO: for megatron-lm self.model is a list
                 self.pre_configure_ddp()
                 # device_ids = self.determine_ddp_device_ids()
-                self._model = DistributedDataParallel(
-                    LightningDistributedModule(self.model),
-                    process_group=parallel_state.get_data_parallel_group(),
-                    **self._ddp_kwargs,
-                )
+
+                self._model = LightningDistributedModule(self.model)
 
                 if self.no_ddp_communication_hook:
                     # When using custom gradient accumulation and allreduce, disable
@@ -277,18 +274,22 @@ class LayerUnitTestStrategy(NLPDDPStrategy):
             # this happens with multiple calls to trainer.test for example
             parallel_state.destroy_model_parallel()
             if torch.distributed.is_initialized():
+                print('nlp_overrides app_state.pipeline_model_parallel_split_rank: ' + str(app_state.pipeline_model_parallel_split_rank))
                 parallel_state.initialize_model_components_parallel(
-                    self.parallelization_specs
+                    parallelization_specs=self.parallelization_specs,
+                    pipeline_model_parallel_split_rank=app_state.pipeline_model_parallel_split_rank,
                 )
 
                 # assert that fake tp and pp rank match after model parallel init
                 assert app_state.tensor_model_parallel_rank == parallel_state.get_tensor_model_parallel_rank()
+                assert app_state.pipeline_component_parallel_rank == parallel_state.get_pipeline_component_parallel_rank()
                 assert app_state.pipeline_model_parallel_rank == parallel_state.get_pipeline_model_parallel_rank()
 
                 app_state.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
                 app_state.data_parallel_group = parallel_state.get_data_parallel_group()
                 app_state.data_parallel_rank = parallel_state.get_data_parallel_rank()
                 app_state.data_parallel_size = parallel_state.get_data_parallel_world_size()
+                app_state.pipeline_component_parallel_group = parallel_state.get_pipeline_component_parallel_group()
                 app_state.pipeline_model_parallel_group = parallel_state.get_pipeline_model_parallel_group()
 
     def check_parallelization_specs(self, parallelization_specs: dict) -> None:
@@ -304,6 +305,7 @@ class LayerUnitTestStrategy(NLPDDPStrategy):
             assert "tensor_model_parallel_group_size" in parallelization_specs[key]
             assert "pipeline_model_parallel_group_size" in parallelization_specs[key]
             assert "micro_batch_size" in parallelization_specs[key]
+
 
 class NLPSaveRestoreConnector(SaveRestoreConnector):
     def __init__(self) -> None:

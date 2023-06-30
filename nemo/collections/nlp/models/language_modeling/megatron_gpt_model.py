@@ -354,6 +354,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             fp8_amax_compute_algo=self.cfg.get('fp8_amax_compute_algo', 'most_recent'),
             reduce_amax=self.cfg.get('reduce_amax', True),
             use_emha=self.cfg.get('use_emha', False),
+            parallelization_specs=self.cfg.get('parallelization_specs', None),
         )
 
         return model
@@ -375,6 +376,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
             # Disable overlapped grad sync for embedding grad when
             # pipeline parallelism is enabled
+            # NOTE: get_pipeline_model_parallel_world_size() -> entire model
+            # NOTE: is_pipeline_first_stage() -> entire model
+            # NOTE: is_pipeline_last_stage() -> entire model
             if parallel_state.get_pipeline_model_parallel_world_size() > 1:
                 if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
                     if isinstance(self.model, list):
@@ -650,6 +654,15 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         # that word_embeddings parameters stay in sync.
         # This should only run for models that support pipelined model parallelism
         # (BERT and GPT-2).
+
+        rank = torch.distributed.get_rank()
+
+        # NOTE: get_pipeline_model_parallel_first_rank() -> entire model
+        # NOTE: get_pipeline_model_parallel_last_rank() -> entire model
+        pipeline_first_rank = parallel_state.get_pipeline_model_parallel_first_rank()
+        pipeline_last_rank = parallel_state.get_pipeline_model_parallel_last_rank()
+
+        # NOTE: get_pipeline_model_parallel_world_size -> entire model
         if parallel_state.get_pipeline_model_parallel_world_size() > 1 and (
             parallel_state.is_pipeline_first_stage(ignore_virtual=True)
             or parallel_state.is_pipeline_last_stage(ignore_virtual=True)
@@ -746,6 +759,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
             # Transfer needed data to GPU
             required_keys = set()
+            # NOTE: get_pipeline_model_parallel_world_size() -> entire model
+            # NOTE: is_pipeline_first_stage() -> entire model
+            # NOTE: is_pipeline_last_stage() -> entire model
             if parallel_state.get_pipeline_model_parallel_world_size() == 1:
                 required_keys.update(batch.keys())
             else:
@@ -854,6 +870,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         return loss
 
     def validation_epoch_end(self, outputs):
+        # NOTE: is_pipeline_last_stage() -> entire model
         if parallel_state.is_pipeline_last_stage():
             # only the last pipeline parallel stages return loss with their batch size
             if self.cfg.data.get('validation_drop_last', True):
@@ -981,6 +998,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self.model
         )
 
+        # NOTE: get_pipeline_model_parallel_rank -> entire model
         logging.info(
             f'Pipeline model parallel rank: {parallel_state.get_pipeline_model_parallel_rank()}, '
             f'Tensor model parallel rank: {parallel_state.get_tensor_model_parallel_rank()}, '
@@ -1030,6 +1048,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self.setup_test_data(self.cfg.data)
 
         # when using pipeline model parallel the final stage need to initialize word embeddings
+        # NOTE: get_pipeline_model_parallel_world_size() -> entire model
         if parallel_state.get_pipeline_model_parallel_world_size() > 1:
             if isinstance(self.model, list):
                 for i, module in enumerate(self.model):

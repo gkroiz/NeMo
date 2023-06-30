@@ -112,6 +112,7 @@ class MegatronBaseModel(NLPModel):
             init_local_rank = trainer.local_rank
 
         initialize_model_parallel_for_nemo(
+            parallelization_specs=cfg.parallelization_specs,
             world_size=init_world_size,
             global_rank=init_global_rank,
             local_rank=init_local_rank,
@@ -557,6 +558,9 @@ class MegatronBaseModel(NLPModel):
     def _get_total_params_across_model_parallel_groups_gpt_bert(self, model):
         """Returns the total number of parameters across all model parallel groups."""
         # log number of parameters
+        # NOTE: get_pipeline_model_parallel_world_size() -> entire model
+        # NOTE: is_pipeline_first_stage() -> entire model
+        # NOTE: is_pipeline_last_stage() -> entire model
         if isinstance(model, list):
             num_parameters_on_device = sum(
                 [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
@@ -593,6 +597,9 @@ class MegatronBaseModel(NLPModel):
         # TODO: If/when we add interleaved model parallelism, we will need to add another if/else here.
         num_parameters_on_device = sum([p.nelement() for p in model.parameters()])
 
+        # NOTE: get_pipeline_model_parallel_world_size() -> entire model
+        # NOTE: is_pipeline_first_stage() -> entire model
+        # NOTE: is_pipeline_last_stage() -> entire model
         if parallel_state.get_pipeline_model_parallel_world_size() > 1 and (
             parallel_state.get_pipeline_model_parallel_rank() == self.cfg.get('pipeline_model_parallel_split_rank', 0)
             or parallel_state.is_pipeline_last_stage()
@@ -611,6 +618,9 @@ class MegatronBaseModel(NLPModel):
                 num_parameters_on_device -= num_position_embedding_parameters
 
         # Check and remove RPE embeddings from the encoder that are replicated.
+        # NOTE: get_pipeline_model_parallel_world_size() -> entire model
+        # NOTE: is_pipeline_first_stage() -> entire model
+        # NOTE: is_pipeline_last_stage() -> entire model
         if (
             parallel_state.get_pipeline_model_parallel_world_size() > 1
             and parallel_state.is_pipeline_stage_before_split()
@@ -622,6 +632,9 @@ class MegatronBaseModel(NLPModel):
             num_parameters_on_device -= num_rpe_params
 
         # Check and remove RPE embeddings from the decoder that are replicated.
+        # NOTE: get_pipeline_model_parallel_world_size() -> entire model
+        # NOTE: is_pipeline_first_stage() -> entire model
+        # NOTE: is_pipeline_last_stage() -> entire model
         if (
             parallel_state.get_pipeline_model_parallel_world_size() > 1
             and parallel_state.is_pipeline_stage_after_split()

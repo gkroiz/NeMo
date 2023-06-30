@@ -25,7 +25,7 @@ from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import Meg
 from nemo.collections.nlp.parts.nlp_overrides import (
     GradScaler,
     MegatronHalfPrecisionPlugin,
-    NLPDDPStrategy,
+    LayerUnitTestStrategy,
     PipelineMixedPrecisionPlugin,
 )
 from nemo.core.config import hydra_runner
@@ -43,15 +43,45 @@ def main(cfg) -> None:
 
     megatron_amp_o2 = cfg.model.get('megatron_amp_O2', False)
     with_distributed_adam = cfg.model.optim.get('name') == 'distributed_fused_adam'
+    parallelization_specs = {
+        "stimulus": {
+            "layers": [0,1,2,3,4,5],
+            "gpu_ranks": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
+            "gpus_per_node": 8,
+            "data_parallel_group_size": 1,
+            "tensor_model_parallel_group_size": 8,
+            "pipeline_model_parallel_group_size": 2,
+            "micro_batch_size": 8
+        },
+        "test": {
+            "layers": [6,7,8],
+            "gpu_ranks": [16,17,18,19,20,21,22,23],
+            "gpus_per_node": 8,
+            "data_parallel_group_size": 1,
+            "tensor_model_parallel_group_size": 8,
+            "pipeline_model_parallel_group_size": 1,
+            "micro_batch_size": 8
+        },
+        "response": {
+            "layers": [9,10,11,12,13,14],
+            "gpu_ranks": [24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39],
+            "gpus_per_node": 8,
+            "data_parallel_group_size": 1,
+            "tensor_model_parallel_group_size": 8,
+            "pipeline_model_parallel_group_size": 2,
+            "micro_batch_size": 8
+        }
+    }
 
     # nvtx.init(enable_function_stack=True)
     with torch.autograd.profiler.emit_nvtx():
 
         plugins = []
-        strategy = NLPDDPStrategy(
+        strategy = LayerUnitTestStrategy(
             no_ddp_communication_hook=True,  # we don't use DDP for async grad allreduce
             gradient_as_bucket_view=cfg.model.gradient_as_bucket_view,
             find_unused_parameters=False,
+            parallelization_specs=parallelization_specs,
         )
         if cfg.trainer.precision in [16, 'bf16']:
             scaler = None
@@ -86,8 +116,11 @@ def main(cfg) -> None:
         # hydra interpolation does not work here as the interpolation key is lost when PTL saves hparams
         with open_dict(cfg):
             cfg.model.precision = cfg.trainer.precision
-
+            cfg.model.parallelization_specs = parallelization_specs
         model = MegatronGPTModel(cfg.model, trainer)
+        print('model: ' + str(model))
+        for name, param in model.named_parameters():
+            print(f'{name}: {param.nelement()}')
         i = 0
         # for module in model.model:
         #     logging.info(f"XXXXXXXXXXXX module {i}: {module}")
@@ -99,9 +132,12 @@ def main(cfg) -> None:
             j += 1
             # i += 1
 
-
+        import time
+        s = time.time()
         trainer.fit(model)
-
+        e = time.time()
+        print(f'Train time: {e-s}s')
+        print(f'Train time: {(e-s):.2f}s')
 
 if __name__ == '__main__':
     main()

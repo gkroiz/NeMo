@@ -163,7 +163,10 @@ class GPTModel(MegatronModule):
         fp8_amax_compute_algo='most_recent',
         reduce_amax=True,
         use_emha=False,
+        parallelization_specs=None,
     ):
+        assert parallelization_specs is not None
+
         super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
         self.parallel_output = parallel_output
@@ -243,6 +246,7 @@ class GPTModel(MegatronModule):
             fp8_amax_compute_algo=fp8_amax_compute_algo,
             reduce_amax=reduce_amax,
             use_emha=use_emha,
+            parallelization_specs=parallelization_specs,
         )
 
         if self.share_embeddings_and_output_weights:
