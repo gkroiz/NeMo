@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from nemo.collections.nlp.parts.nlp_overrides import (
@@ -47,6 +48,12 @@ def main(cfg) -> None:
   with_distributed_adam = (
       cfg.model.optim.get('name') == 'distributed_fused_adam'
   )
+  
+  sibling = os.environ.get("SIBLING")
+  if sibling == "younger":
+    os.environ["MASTER_PORT"] = str(6004)
+    cfg.trainer.max_epochs = 3
+    cfg.trainer.max_steps = 15
 
   with torch.autograd.profiler.emit_nvtx():
     plugins = []
@@ -113,7 +120,7 @@ def main(cfg) -> None:
     with open_dict(cfg):
       cfg.model.precision = cfg.trainer.precision
 
-    model = MegatronGPTModel(cfg.model, trainer)
+    model = MegatronGPTModel(cfg.model, trainer, sibling)
 
     import time
 

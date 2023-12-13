@@ -335,14 +335,18 @@ class GPTDataset(Dataset):
         self.index_mapping_dir = cfg.data.get('index_mapping_dir', None)
 
         # create index_mapping_dir on rank 0
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            if torch.distributed.get_rank() == 0:
-                if self.index_mapping_dir is not None and not os.path.isdir(self.index_mapping_dir):
-                    os.makedirs(self.index_mapping_dir)
-            torch.distributed.barrier()
+
+        # this can be skipped on younger siblings since index_mapping_dir is already created on rank 0
+        sibling = os.environ.get("SIBLING")
+        if sibling != "younger":
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                if torch.distributed.get_rank() == 0:
+                    if self.index_mapping_dir is not None and not os.path.isdir(self.index_mapping_dir):
+                        os.makedirs(self.index_mapping_dir)
+                torch.distributed.barrier()
 
         # Build index mappings.
-        self.doc_idx, self.sample_idx, self.shuffle_idx = _build_index_mappings(
+        self.doc_idx, self.sample_idx, self.shuffle_idx, self.indices = _build_index_mappings(
             self.name,
             data_prefix,
             documents,
@@ -672,15 +676,18 @@ def _build_index_mappings(
                 ' (seconds): {:4f}'.format(time.time() - start_time)
             )
 
-    torch.distributed.barrier()
-    for group in parallel_state.get_pipeline_model_parallel_groups():
-        counts = torch.cuda.LongTensor([1])
-        torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
-        torch.distributed.all_reduce(counts, group=group)
-    assert counts[0].item() == (
-        torch.distributed.get_world_size()
-        // torch.distributed.get_world_size(group=parallel_state.get_tensor_model_parallel_group())
-    )
+    # we can skip this on younger siblings since it is only a check
+    sibling = os.environ.get("SIBLING")
+    if sibling != "younger":
+        torch.distributed.barrier()
+        for group in parallel_state.get_pipeline_model_parallel_groups():
+            counts = torch.cuda.LongTensor([1])
+            torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
+            torch.distributed.all_reduce(counts, group=group)
+        assert counts[0].item() == (
+            torch.distributed.get_world_size()
+            // torch.distributed.get_world_size(group=parallel_state.get_tensor_model_parallel_group())
+        )
 
     if not exchange_indices_distributed or (torch.distributed.get_rank() == 0 and using_cached_indices):
         # Load mappings.
@@ -703,7 +710,7 @@ def _build_index_mappings(
         torch.distributed.broadcast_object_list(indices)
         doc_idx, sample_idx, shuffle_idx = indices[0]
 
-    return doc_idx, sample_idx, shuffle_idx
+    return doc_idx, sample_idx, shuffle_idx, indices
 
 
 def _num_tokens(documents, sizes):

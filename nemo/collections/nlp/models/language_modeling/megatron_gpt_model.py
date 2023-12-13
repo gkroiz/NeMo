@@ -195,7 +195,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
     Megatron GPT pretraining
     """
 
-    def __init__(self, cfg: DictConfig, trainer: Trainer):
+    def __init__(self, cfg: DictConfig, trainer: Trainer, sibling: str):
         if not HAVE_APEX:
             raise ImportError(
                 "Apex was not found. Please see the NeMo README for installation instructions: https://github.com/NVIDIA/NeMo#megatron-gpt."
@@ -285,6 +285,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         self.get_attention_mask_from_fusion = self.cfg.get('get_attention_mask_from_fusion', True)
         self.initialize_ub = self.cfg.get('ub_tp_comm_overlap', False)
         self.epoch_count = 0
+        self.sibling = sibling
+        self.optimizer_name = self.cfg.optim.get('name', None)
 
     def get_gpt_module_list(self):
         if isinstance(self.model, list):
@@ -1016,16 +1018,19 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         Args:
             stage (str, optional): Can be 'fit', 'validate', 'test' or 'predict'. Defaults to None.
         """
-        num_parameters_on_device, total_num_parameters = self._get_total_params_across_model_parallel_groups_gpt_bert(
-            self.model
-        )
-
         logging.info(
-            f'Pipeline model parallel rank: {parallel_state.get_pipeline_model_parallel_rank()}, '
-            f'Tensor model parallel rank: {parallel_state.get_tensor_model_parallel_rank()}, '
-            f'Number of model parameters on device: {num_parameters_on_device:.2e}. '
-            f'Total number of model parameters: {total_num_parameters:.2e}.'
+                f'Pipeline model parallel rank: {parallel_state.get_pipeline_model_parallel_rank()}, '
+                f'Tensor model parallel rank: {parallel_state.get_tensor_model_parallel_rank()}, '
         )
+        if self.sibling != "younger":
+            num_parameters_on_device, total_num_parameters = self._get_total_params_across_model_parallel_groups_gpt_bert(
+                self.model
+            )
+
+            logging.info(
+                f'Number of model parameters on device: {num_parameters_on_device:.2e}. '
+                f'Total number of model parameters: {total_num_parameters:.2e}.'
+            )
 
         resume_checkpoint_path = self.trainer._checkpoint_connector.resume_from_checkpoint_fit_path
         if resume_checkpoint_path:
@@ -1346,104 +1351,227 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 if hasattr(mod, "sequence_parallel"):
                     mod.sequence_parallel = self.last_sequence_parallel
 
-    def on_train_epoch_end(self):
-        # this function will switch the training strategy between 4-4-4 configuration to a 4-2-4 configuration after the third epoch (epoch 2).
+    def _copy_model_weights(self, peer_rank: int, direction: str=["send, recv"]):
+        """ Copies/sends model weights."""
+        for name, param in self.model[0].named_parameters():
+            if direction == "send":
+                torch.distributed.send(param.data, peer_rank)
+            elif direction == "recv":
+                torch.distributed.recv(param.data, peer_rank)
+            else:
+                ValueError("direction must be defined as `send` or `recv`")
+
+    def on_train_epoch_start(self):
+        print(f'Beginning of train epoch ', self.epoch_count, flush=True)
+        # this function demonstrates scaling down VM count and then scaling up VM count
         # The values here are hardcoded, this will not work with other model configurations.
-        if self.epoch_count == 2:
-            if torch.distributed.is_initialized():
-                assert self.cfg.transformer_engine == False
-                assert self.cfg.fp8 == False
-                
-                world_size = torch.distributed.get_world_size()
-                rank = torch.distributed.get_rank()
+        if self.sibling == "older":
+            # scale down block
+            if self.epoch_count == 3:
+                if torch.distributed.is_initialized():
+                    print('Scaling down number of VMs', flush=True)
+                    assert self.cfg.transformer_engine == False
+                    assert self.cfg.fp8 == False
+                    
+                    world_size = torch.distributed.get_world_size()
+                    rank = torch.distributed.get_rank()
 
-                # destroy existing process group
-                parallel_state.destroy_model_parallel()
-                torch.distributed.destroy_process_group()
+                    # destroy existing process group
+                    parallel_state.destroy_model_parallel()
+                    torch.distributed.destroy_process_group()
 
-                all_ranks = list(range(0,32)) + list(range(40,56)) + list(range(64,96))
-                if rank in list(range(32, 40)) or rank in list(range(56, 64)):
-                    print(f'exiting rank {rank}!', flush=True)
-                    exit(0)
+                    all_ranks = list(range(0,32)) + list(range(40,56)) + list(range(64,96))
+                    if rank in list(range(32, 40)) or rank in list(range(56, 64)):
+                        print(f'exiting rank {rank}!', flush=True)
+                        exit(0)
 
-                # create new process group
-                os.environ["MASTER_PORT"] = str(int(os.environ["MASTER_PORT"]) + 1)
-                print(f"Before Initializing distributed: GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
-                torch.distributed.init_process_group(backend="nccl", world_size=world_size-16, rank=all_ranks.index(rank))
-                world_size = torch.distributed.get_world_size()
-                rank = torch.distributed.get_rank()
-                print(f"After Initializing distributed: NEW GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
+                    # create new process group
+                    os.environ["MASTER_PORT"] = str(6003)
+                    print(f"Before Initializing distributed: GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
+                    torch.distributed.init_process_group(backend="nccl", world_size=world_size-16, rank=all_ranks.index(rank))
+                    world_size = torch.distributed.get_world_size()
+                    rank = torch.distributed.get_rank()
+                    print(f"After Initializing distributed: NEW GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
 
-                # test new process group
-                t = torch.tensor(1).to((rank % 8))
-                torch.distributed.all_reduce(t)
+                    # test new process group
+                    t = torch.tensor(1).to((rank % 8))
+                    torch.distributed.all_reduce(t)
 
-                # define new parallelization specs (4-2-4)
-                app_state = AppState()
+                    # define new parallelization specs (4-2-4)
+                    app_state = AppState()
 
-                parallelization_specs = {
-                    "stimulus": {
-                        "layers": [0],
-                        "gpu_ranks": list(range(0,32)),
-                        "gpus_per_node": 8,
-                        "data_parallel_group_size": 4,
-                        "tensor_model_parallel_group_size": 8,
-                        "pipeline_model_parallel_group_size": 1,
-                        },
-                    "test": {
-                        "layers": [1],
-                        "gpu_ranks": list(range(32,48)),
-                        "gpus_per_node": 8,
-                        "data_parallel_group_size": 2,
-                        "tensor_model_parallel_group_size": 8,
-                        "pipeline_model_parallel_group_size": 1,
-                        },
-                    "response": {
-                        "layers": [2],
-                        "gpu_ranks": list(range(48,80)),
-                        "gpus_per_node": 8,
-                        "data_parallel_group_size": 4,
-                        "tensor_model_parallel_group_size": 8,
-                        "pipeline_model_parallel_group_size": 1,
+                    parallelization_specs = {
+                        "stimulus": {
+                            "layers": [0],
+                            "gpu_ranks": list(range(0,32)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            },
+                        "test": {
+                            "layers": [1],
+                            "gpu_ranks": list(range(32,48)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 2,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            },
+                        "response": {
+                            "layers": [2],
+                            "gpu_ranks": list(range(48,80)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            }
                         }
-                    }
 
-                # create all new distributed process groups
-                parallel_state.initialize_model_components_parallel(
-                    parallelization_specs=parallelization_specs,
-                    virtual_pipeline_model_parallel_size=app_state.virtual_pipeline_model_parallel_size,
-                    pipeline_model_parallel_split_rank=app_state.pipeline_model_parallel_split_rank,
-                    use_fp8=app_state.use_fp8,
-                )
+                    # create all new distributed process groups
+                    parallel_state.initialize_model_components_parallel(
+                        parallelization_specs=parallelization_specs,
+                        virtual_pipeline_model_parallel_size=app_state.virtual_pipeline_model_parallel_size,
+                        pipeline_model_parallel_split_rank=app_state.pipeline_model_parallel_split_rank,
+                        use_fp8=app_state.use_fp8,
+                    )
 
-                # assert that fake tp, dp, and pp rank match after model parallel init
-                assert app_state.tensor_model_parallel_rank == parallel_state.get_tensor_model_parallel_rank()
-                assert app_state.pipeline_component_parallel_rank == parallel_state.get_pipeline_component_parallel_rank()
-                assert app_state.pipeline_model_parallel_rank == parallel_state.get_pipeline_model_parallel_rank()
+                    # assert that fake tp, dp, and pp rank match after model parallel init
+                    assert app_state.tensor_model_parallel_rank == parallel_state.get_tensor_model_parallel_rank()
+                    assert app_state.pipeline_component_parallel_rank == parallel_state.get_pipeline_component_parallel_rank()
+                    assert app_state.pipeline_model_parallel_rank == parallel_state.get_pipeline_model_parallel_rank()
 
-                app_state.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
-                app_state.data_parallel_group = parallel_state.get_data_parallel_group()
-                app_state.data_parallel_rank = parallel_state.get_data_parallel_rank()
-                app_state.data_parallel_size = parallel_state.get_data_parallel_world_size()
-                app_state.pipeline_component_parallel_group = parallel_state.get_pipeline_component_parallel_group()
-                app_state.pipeline_model_parallel_group = parallel_state.get_pipeline_model_parallel_group()
-                
-                # reset groups and vars in optimizer
-                self.trainer.optimizers[0].process_group = parallel_state.get_data_parallel_group()
-                self_groups = [torch.distributed.new_group(ranks=[i]) for i in range(world_size)]
-                self.trainer.optimizers[0].distributed_process_group = self_groups[rank]
-                self.trainer.optimizers[0].redundant_process_group = parallel_state.get_data_parallel_group()
-                self.trainer.optimizers[0].process_group_size = torch.distributed.get_world_size(self.trainer.optimizers[0].process_group)
-                self.trainer.optimizers[0].distributed_rank = torch.distributed.get_rank(self.trainer.optimizers[0].distributed_process_group)
-                self.trainer.optimizers[0].distributed_size = torch.distributed.get_world_size(self.trainer.optimizers[0].distributed_process_group)
-                self.trainer.optimizers[0].redundant_size = torch.distributed.get_world_size(self.trainer.optimizers[0].redundant_process_group)
-                try:
-                    from torch.distributed.distributed_c10d import get_global_rank
-                except ImportError:
-                    from torch.distributed.distributed_c10d import _get_global_rank
+                    app_state.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
+                    app_state.data_parallel_group = parallel_state.get_data_parallel_group()
+                    app_state.data_parallel_rank = parallel_state.get_data_parallel_rank()
+                    app_state.data_parallel_size = parallel_state.get_data_parallel_world_size()
+                    app_state.pipeline_component_parallel_group = parallel_state.get_pipeline_component_parallel_group()
+                    app_state.pipeline_model_parallel_group = parallel_state.get_pipeline_model_parallel_group()
 
-                    get_global_rank = _get_global_rank
+                    # redistribute optimizer state
+                    if self.optimizer_name == "distributed_fused_adam":
+                        self.trainer.strategy._custom_optimizer_setup(self.trainer)
 
-                self.trainer.optimizers[0].process_group_root = get_global_rank(self.trainer.optimizers[0].process_group, 0)
+            # scale up block
+            if self.epoch_count == 6:
+                if torch.distributed.is_initialized():
+                    print('Scaling up number of VMs', flush=True)
+                    assert self.cfg.transformer_engine == False
+                    assert self.cfg.fp8 == False
 
+                    world_size = torch.distributed.get_world_size()
+                    rank = torch.distributed.get_rank()
+
+                    # destroy existing process group
+                    parallel_state.destroy_model_parallel()
+                    torch.distributed.destroy_process_group()
+
+                    # create new process group
+                    os.environ["MASTER_PORT"] = str(6004)
+                    print(f"Before Initializing distributed: GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
+
+                    if rank >= 48:
+                        rank += 8
+                    if rank >= 32:
+                        rank += 8
+
+                    torch.distributed.init_process_group(backend="nccl", world_size=world_size+16, rank=rank)
+                    world_size = torch.distributed.get_world_size()
+                    rank = torch.distributed.get_rank()
+                    print(f"After Initializing distributed: NEW GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
+
+                    app_state = AppState()
+                    # create all new distributed process groups
+                    parallelization_specs = {
+                        "stimulus": {
+                            "layers": [0],
+                            "gpu_ranks": list(range(0,32)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            },
+                        "test": {
+                            "layers": [1],
+                            "gpu_ranks": list(range(32,64)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            },
+                        "response": {
+                            "layers": [2],
+                            "gpu_ranks": list(range(64,96)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            }
+                        }
+                    parallel_state.initialize_model_components_parallel(
+                        parallelization_specs=parallelization_specs,
+                        virtual_pipeline_model_parallel_size=app_state.virtual_pipeline_model_parallel_size,
+                        pipeline_model_parallel_split_rank=app_state.pipeline_model_parallel_split_rank,
+                        use_fp8=app_state.use_fp8,
+                    )
+
+                    # assert that fake tp, dp, and pp rank match after model parallel init
+                    assert app_state.tensor_model_parallel_rank == parallel_state.get_tensor_model_parallel_rank()
+                    assert app_state.pipeline_component_parallel_rank == parallel_state.get_pipeline_component_parallel_rank()
+                    assert app_state.pipeline_model_parallel_rank == parallel_state.get_pipeline_model_parallel_rank()
+
+                    app_state.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
+                    app_state.data_parallel_group = parallel_state.get_data_parallel_group()
+                    app_state.data_parallel_rank = parallel_state.get_data_parallel_rank()
+                    app_state.data_parallel_size = parallel_state.get_data_parallel_world_size()
+                    app_state.pipeline_component_parallel_group = parallel_state.get_pipeline_component_parallel_group()
+                    app_state.pipeline_model_parallel_group = parallel_state.get_pipeline_model_parallel_group()
+
+
+                    # create sibling group (need to create on all processes)
+                    ranks = list(range(32,40)) + list(range(56,64))
+                    sibling_group = torch.distributed.new_group(ranks=ranks)
+
+                    # setup new VM's profilers
+                    self.trainer._Trainer__setup_profiler()
+                    
+                    torch.distributed.broadcast_object_list(self._train_ds.datasets[0].indices)
+                    torch.distributed.broadcast_object_list(self._validation_ds.datasets[0].indices)
+                    torch.distributed.broadcast_object_list(self._test_ds.datasets[0].indices)
+
+                    # redistribute optimizer state
+                    if self.optimizer_name == "distributed_fused_adam":
+                        self.trainer.strategy._custom_optimizer_setup(self.trainer)
+
+                    # call on_fit_start for syncronization with younger sibling processes
+                    self.trainer._call_callback_hooks("on_fit_start")
+                    
+                    # call resume_end to syncronize with younger sibling processes
+                    self.trainer._checkpoint_connector.resume_end()
+
+                    # update sibling_group
+                    import torch.distributed.distributed_c10d as c10d
+
+                    self.trainer.sibling_group = c10d._world.default_pg
+
+                    # send model weights to younger sibling VMs
+                    if rank in list(range(40, 48)):
+                        self._copy_model_weights(rank - 8, "send")
+                    if rank in list(range(48, 56)):
+                        self._copy_model_weights(rank + 8, "send")
+
+        if self.sibling == "younger" and self.epoch_count == 0:
+            rank = torch.distributed.get_rank()
+
+            # update sibling_group
+            import torch.distributed.distributed_c10d as c10d
+
+            self.trainer.sibling_group = c10d._world.default_pg
+            
+            # recv model weights from older sibling VMs
+            if rank in list(range(32, 40)):
+                self._copy_model_weights(rank + 8, "recv")
+            if rank in list(range(56, 64)):
+                self._copy_model_weights(rank - 8, "recv")
+        # epoch counter
         self.epoch_count += 1
+        print('in megatron_gpt_model.py leaving on_train_epoch_start, epoch_count = ', self.epoch_count, flush=True)

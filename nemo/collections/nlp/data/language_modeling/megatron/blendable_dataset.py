@@ -14,6 +14,7 @@
 
 """Blendable dataset."""
 
+import os
 import time
 
 import numpy as np
@@ -49,7 +50,13 @@ class BlendableDataset(torch.utils.data.Dataset):
                 from nemo.collections.nlp.data.language_modeling.megatron.dataset_utils import compile_helper
 
                 compile_helper()
-            torch.distributed.barrier()
+            sibling = os.environ.get("SIBLING")
+            if sibling != "younger":
+                # barrier will stall forever on younger VMs,
+                # so it is skipped and replaced by "time barrier"
+                torch.distributed.barrier()
+            else:
+                time.sleep(10)
             from nemo.collections.nlp.data.language_modeling.megatron import helpers
         except ImportError:
             raise ImportError(

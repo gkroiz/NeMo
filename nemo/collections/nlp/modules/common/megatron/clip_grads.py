@@ -135,9 +135,11 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
         total_norm_cuda = torch.cuda.FloatTensor(
             [float(total_norm)]
         )  # (@adithyare) total_norm can be a float at this point so we convert it to cuda.FloatTensor
-        torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=parallel_state.get_model_parallel_group()
-        )
+        # TODO (gersonkroiz): value of total_norm_cuda does not make sense here, is defined as such for functionality
+        for model_parallel_group in parallel_state.get_model_parallel_groups():
+            torch.distributed.all_reduce(
+                total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
+            )
         total_norm = total_norm_cuda[0].item()
         total_norm = total_norm ** (1.0 / norm_type)
 
