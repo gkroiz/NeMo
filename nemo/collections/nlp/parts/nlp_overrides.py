@@ -865,6 +865,7 @@ class MegatronHalfPrecisionPlugin(NativeMixedPrecisionPlugin):
     def __init__(
         self, precision: Union[str, int], device: str, scaler: Optional[torch.cuda.amp.GradScaler] = None
     ) -> None:
+        print('in nlp_overrides.py in MegatronHalfPrecisionPlugin __init__', flush=True)
         super().__init__(precision, device, scaler)
         dtype = None
         if precision == 16:
@@ -886,10 +887,15 @@ class MegatronHalfPrecisionPlugin(NativeMixedPrecisionPlugin):
             optimizer, MainParamsOptimizerWrapper
         ), "MegatronHalfPrecisionPlugin supports only the optimizer with master parameters"
 
+        print('in nlp_overrides.py in optimizer_step self.scaler: ', self.scaler, flush=True)
+        print('in nlp_overrides.py closure: ', closure, flush=True)
         if self.scaler is None:
             assert optimizer.fp32_grad_accumulation, "BF16 uses FP32 grad accumulation"
+            print('in nlp_overrides.py before closure: ', flush=True)
             _ = closure()
+            print('in nlp_overrides.py before _after_closure: ', flush=True)
             self._after_closure(model, optimizer, optimizer_idx)
+            print('in nlp_overrides.py after _after_closure: ', flush=True)
             return optimizer.step(**kwargs)
 
         if isinstance(optimizer, torch.optim.LBFGS):

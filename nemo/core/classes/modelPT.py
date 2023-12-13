@@ -189,8 +189,11 @@ class ModelPT(LightningModule, Model):
         cls._save_restore_connector = SaveRestoreConnector()
 
     def on_fit_start(self) -> None:
+        print('in modelPT.py in on_fit_start', flush=True)
         if self.cfg.get("dump_debug_info", False):
+            print('in modelPT.py before register_debug_hooks', flush=True)
             register_debug_hooks(self.model, self.trainer, self.log, self.cfg.get("dump_debug_info_to_file", False))
+            print('in modelPT.py after register_debug_hooks', flush=True)
         return super().on_fit_start()
 
     def register_artifact(

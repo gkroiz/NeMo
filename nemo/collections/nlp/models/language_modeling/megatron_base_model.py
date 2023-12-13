@@ -278,6 +278,7 @@ class MegatronBaseModel(NLPModel):
         """PTL hook to configure gradients.
            We use gradient clipping implementation from megatron-lm.
         """
+        print('in megatron_base_model.py in configure_gradient_clipping', flush=True)
         clip_val = self.trainer.gradient_clip_val
         if clip_val is None:
             return
@@ -288,17 +289,25 @@ class MegatronBaseModel(NLPModel):
 
         if self.grad_clip_pl_default:
             # use the default behavior
+            print('in megatron_base_model.py in configure_gradient_clipping before super.configure_gradient_clipping', flush=True)
             return super().configure_gradient_clipping(*args, **kwargs)
+            print('in megatron_base_model.py in configure_gradient_clipping after super.configure_gradient_clipping', flush=True)
 
         if self.with_distributed_adam:
+            print('in megatron_base_model.py in configure_gradient_clipping before clip_grad_norm_distributed_optimizer', flush=True)
             grad_norm = clip_grad_norm_distributed_optimizer(self._optimizer, clip_val)
+            print('in megatron_base_model.py in configure_gradient_clipping after clip_grad_norm_distributed_optimizer', flush=True)
         else:
             if self.megatron_amp_o2:
                 # grep fp32 master parameters for gradient clipping
+                print('in megatron_base_model.py in configure_gradient_clipping before get_parameters_with_grad', flush=True)
                 parameters = self._optimizer.get_parameters_with_grad()
+                print('in megatron_base_model.py in configure_gradient_clipping after get_parameters_with_grad', flush=True)
             else:
                 parameters = self.get_parameters_with_grad()
+            print('in megatron_base_model.py in configure_gradient_clipping before clip_grad_norm_fp32', flush=True)
             grad_norm = clip_grad_norm_fp32(parameters=parameters, max_norm=clip_val)
+            print('in megatron_base_model.py in configure_gradient_clipping after clip_grad_norm_fp32', flush=True)
 
         self.log('grad_norm', grad_norm, rank_zero_only=True, batch_size=1)
 

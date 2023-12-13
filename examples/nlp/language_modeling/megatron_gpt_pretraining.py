@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from nemo.collections.nlp.parts.nlp_overrides import (
@@ -40,6 +41,8 @@ utilities.monitor_collectives.shunt_torch_communication()
 
 @hydra_runner(config_path='conf', config_name='megatron_gpt_config')
 def main(cfg) -> None:
+  import logging as default_logging
+  
   logging.info('\n\n************** Experiment configuration ***********')
   logging.info(f'\n{OmegaConf.to_yaml(cfg)}')
 
@@ -47,6 +50,12 @@ def main(cfg) -> None:
   with_distributed_adam = (
       cfg.model.optim.get('name') == 'distributed_fused_adam'
   )
+  
+  sibling = os.environ.get("SIBLING")
+  if sibling == "younger":
+    os.environ["MASTER_PORT"] = str(6004)
+    cfg.trainer.max_epochs = 3
+    cfg.trainer.max_steps = 15
 
   with torch.autograd.profiler.emit_nvtx():
     plugins = []
@@ -92,6 +101,7 @@ def main(cfg) -> None:
       plugins.append(TorchElasticEnvironment())
 
     trainer = Trainer(plugins=plugins, strategy=strategy, **cfg.trainer)
+    print('in megatron_gpt_pretraining.py, trainer.max_epochs: ', trainer.max_epochs, flush=True)
 
     exp_manager(trainer, cfg.exp_manager)
 
@@ -113,7 +123,8 @@ def main(cfg) -> None:
     with open_dict(cfg):
       cfg.model.precision = cfg.trainer.precision
 
-    model = MegatronGPTModel(cfg.model, trainer)
+    print('sibling: ', sibling)
+    model = MegatronGPTModel(cfg.model, trainer, sibling)
 
     import time
 

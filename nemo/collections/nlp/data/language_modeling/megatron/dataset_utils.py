@@ -1328,14 +1328,20 @@ def get_samples_mapping(
         logging.info(
             ' > elasped time to build and save samples mapping ' '(seconds): {:4f}'.format(time.time() - start_time)
         )
-    torch.distributed.barrier()
-    counts = torch.cuda.LongTensor([1])
-    torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
-    torch.distributed.all_reduce(counts, group=parallel_state.get_pipeline_model_parallel_group())
-    assert counts[0].item() == (
-        torch.distributed.get_world_size()
-        // torch.distributed.get_world_size(group=parallel_state.get_tensor_model_parallel_group())
-    )
+    
+    print('in dataset_utils.py before barrier')
+    # we can skip this on younger siblings since it is only a check
+    sibling = os.environ.get("SIBLING")
+    if sibling != "younger":
+        torch.distributed.barrier()
+        counts = torch.cuda.LongTensor([1])
+        torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
+        torch.distributed.all_reduce(counts, group=parallel_state.get_pipeline_model_parallel_group())
+        assert counts[0].item() == (
+            torch.distributed.get_world_size()
+            // torch.distributed.get_world_size(group=parallel_state.get_tensor_model_parallel_group())
+        )
+    print('in dataset_utils.py after barrier')
     # Load indexed dataset if not given externally.
     if samples_mapping is None:
         logging.info(' > loading indexed mapping from {}'.format(indexmap_filename))

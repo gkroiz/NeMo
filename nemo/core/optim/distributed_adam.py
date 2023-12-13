@@ -51,11 +51,15 @@ class MegatronDistributedFusedAdam(DistributedFusedAdam):
     def __init__(self, params, disable_distributed_parameters=False, **kwargs):
 
         # Initialize process groups
+        print(f'CHECK_THIS in distributed_adam.py, kwargs: {kwargs}', flush=True)
+        print('in distributed_adam.py disable_distributed_parameters: ', disable_distributed_parameters, flush=True)
         if 'process_group' not in kwargs and not parallel_state.is_unitialized():
+            print("CHECK_THIS process_group not in kwargs and parallel_state is initialized", flush=True)
             kwargs['process_group'] = parallel_state.get_data_parallel_group()
         if disable_distributed_parameters:
             world_size = torch.distributed.get_world_size()
             rank = torch.distributed.get_rank()
+            print('in distributed_adam.py before self_groups', flush=True)
             self_groups = [torch.distributed.new_group(ranks=[i]) for i in range(world_size)]
             kwargs['distributed_process_group'] = self_groups[rank]
             kwargs['redundant_process_group'] = kwargs['process_group']
@@ -110,7 +114,9 @@ class MegatronDistributedFusedAdam(DistributedFusedAdam):
             self._fp32_optim_grad_sync_needed = True
 
         # Construct distributed optimizer
+        print('in distributed_adam before super().__init', flush=True)
         super().__init__(distopt_param_groups, **kwargs)
+        print('in distributed_adam after super().__init', flush=True)
 
     def _make_post_backward_hook(self, param, param_group_id, param_id):
         def hook(*unused):
@@ -176,11 +182,14 @@ class MegatronDistributedFusedAdam(DistributedFusedAdam):
         sync_requests = []
         with _coalescing_manager(self.process_group, self.device, sync_requests):
             for main_param in self._fp32_optim_main_params.values():
+                rank = torch.distributed.get_rank()
+                print(f'rank {rank} in distributed_adam.py in _fp32_optim_grad_sync before all_reduce', flush=True)
                 sync_requests.append(
                     torch.distributed.all_reduce(
                         main_param.grad, op=torch.distributed.ReduceOp.AVG, group=self.process_group, async_op=True,
                     )
                 )
+                print(f'rank {rank} in distributed_adam.py in _fp32_optim_grad_sync after all_reduce', flush=True)
         for req in sync_requests:
             req.wait()
         self._fp32_optim_grad_sync_needed = False
@@ -235,9 +244,18 @@ class MegatronDistributedFusedAdam(DistributedFusedAdam):
                             grad_norm_sq += torch.linalg.norm(main_param.grad) ** 2 / self.process_group_size
 
             # Sum over all procs to get grad norm
+            rank = torch.distributed.get_rank()
+            print(f'rank {rank} | in distributed_adam.py self.process_group', self.process_group, flush=True)
+            print(f'rank {rank} | in distributed_adam.py self.distributed_process_group', self.distributed_process_group, flush=True)
+            print(f'rank {rank} | in distributed_adam.py torch.distributed.get_world_size()', torch.distributed.get_world_size(), flush=True)
+            print(f'rank {rank} | in distributed_adam.py torch.distributed.get_world_size(self.process_group)', torch.distributed.get_world_size(self.process_group), flush=True)
+            print(f'rank {rank} | in distributed_adam.py torch.distributed.get_world_size(self.distributed_process_group)', torch.distributed.get_world_size(self.distributed_process_group), flush=True)
+            torch.distributed.get_world_size
+            print(f'rank {rank} | in distributed_adam.py in grad_norm before all_reduce', flush=True)
             torch.distributed.all_reduce(
                 grad_norm_sq, op=torch.distributed.ReduceOp.SUM,
             )
+            print(f'rank {rank} | in distributed_adam.py in grad_norm after all_reduce', flush=True)
             self._grad_norm = grad_norm_sq.sqrt()
 
         # Use cached grad norm

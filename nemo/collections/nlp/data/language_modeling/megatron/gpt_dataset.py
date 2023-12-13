@@ -42,6 +42,8 @@ except (ImportError, ModuleNotFoundError):
 
 
 def build_dataset(cfg, trainer, data_prefix, data_impl, num_samples, seq_length, seed, skip_warmup, tokenizer, name):
+    print('in gpt_dataset.py in build_dataset', flush=True)
+    # gkroiz: not in here
     def _build_dataset(current_data_prefix, current_num_samples):
         delay_data_mmap = cfg.data.get('delay_data_mmap', False)
         indexed_dataset = get_indexed_dataset_(current_data_prefix, data_impl, skip_warmup, delay_data_mmap)
@@ -92,6 +94,7 @@ def build_train_valid_test_datasets(
     skip_warmup,
     tokenizer,
 ):
+    print('in gpt_dataset.py in build_train_valid_test_datasets', flush=True)
     if data_impl in ['mock']:
         logging.info('Initializing mock GPT dataset for train, validate, and test')
         if len(data_prefix) != 0:
@@ -199,6 +202,7 @@ def build_train_valid_test_datasets(
         train_n, valid_n, test_n = map(sum, zip(*datasets_train_valid_test_num_samples))
 
         # Blend.
+        print('in gpt_dataset.py before blending')
         blending_train_dataset = None
         if train_datasets:
             blending_train_dataset = BlendableDataset(train_datasets, weights, train_n)
@@ -225,6 +229,7 @@ def _build_train_valid_test_datasets(
     tokenizer,
 ):
     """Build train, valid, and test datasets."""
+    print('in gpt_dataset.py in _build_train_valid_test_datasets', flush=True)
 
     # Indexed dataset.
     delay_data_mmap = cfg.data.get('delay_data_mmap', False)
@@ -269,8 +274,11 @@ def _build_train_valid_test_datasets(
             )
         return dataset
 
+    print('in gpt_dataset.py before build train_dataset', flush=True)
     train_dataset = build_dataset(0, 'train')
+    print('in gpt_dataset.py before build valid_dataset', flush=True)
     valid_dataset = build_dataset(1, 'valid')
+    print('in gpt_dataset.py before build test_dataset', flush=True)
     test_dataset = build_dataset(2, 'test')
 
     return (train_dataset, valid_dataset, test_dataset)
@@ -335,14 +343,19 @@ class GPTDataset(Dataset):
         self.index_mapping_dir = cfg.data.get('index_mapping_dir', None)
 
         # create index_mapping_dir on rank 0
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            if torch.distributed.get_rank() == 0:
-                if self.index_mapping_dir is not None and not os.path.isdir(self.index_mapping_dir):
-                    os.makedirs(self.index_mapping_dir)
-            torch.distributed.barrier()
+        
+        # this can be skipped on younger siblings since index_mapping_dir is already created on rank 0
+        sibling = os.environ.get("SIBLING")
+        if sibling != "younger":
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                if torch.distributed.get_rank() == 0:
+                    if self.index_mapping_dir is not None and not os.path.isdir(self.index_mapping_dir):
+                        os.makedirs(self.index_mapping_dir)
+                torch.distributed.barrier()
 
+        print('in gpt_dataset.py in GPTDataset.__init__ before _build_index_mappings', flush=True)
         # Build index mappings.
-        self.doc_idx, self.sample_idx, self.shuffle_idx = _build_index_mappings(
+        self.doc_idx, self.sample_idx, self.shuffle_idx, self.indices = _build_index_mappings(
             self.name,
             data_prefix,
             documents,
@@ -356,6 +369,7 @@ class GPTDataset(Dataset):
             shuffle_documents=self.shuffle_documents,
             exchange_indices_distributed=self.exchange_indices_distributed,
         )
+        print('in gpt_dataset.py in GPTDataset.__init__ after _build_index_mappings', flush=True)
         deallocate_indexed_dataset_memory(self.indexed_dataset)
 
     def create_data_mmap(self):
@@ -672,15 +686,18 @@ def _build_index_mappings(
                 ' (seconds): {:4f}'.format(time.time() - start_time)
             )
 
-    torch.distributed.barrier()
-    for group in parallel_state.get_pipeline_model_parallel_groups():
-        counts = torch.cuda.LongTensor([1])
-        torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
-        torch.distributed.all_reduce(counts, group=group)
-    assert counts[0].item() == (
-        torch.distributed.get_world_size()
-        // torch.distributed.get_world_size(group=parallel_state.get_tensor_model_parallel_group())
-    )
+    # we can skip this on younger siblings since it is only a check
+    sibling = os.environ.get("SIBLING")
+    if sibling != "younger":
+        torch.distributed.barrier()
+        for group in parallel_state.get_pipeline_model_parallel_groups():
+            counts = torch.cuda.LongTensor([1])
+            torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
+            torch.distributed.all_reduce(counts, group=group)
+        assert counts[0].item() == (
+            torch.distributed.get_world_size()
+            // torch.distributed.get_world_size(group=parallel_state.get_tensor_model_parallel_group())
+        )
 
     if not exchange_indices_distributed or (torch.distributed.get_rank() == 0 and using_cached_indices):
         # Load mappings.
@@ -700,10 +717,12 @@ def _build_index_mappings(
             indices = [(doc_idx, sample_idx, shuffle_idx)]
         else:
             indices = [None]
+        print('in gpt_dataset.py before broadcast_object_list', flush=True)
         torch.distributed.broadcast_object_list(indices)
+        print('in gpt_dataset.py after broadcast_object_list', flush=True)
         doc_idx, sample_idx, shuffle_idx = indices[0]
 
-    return doc_idx, sample_idx, shuffle_idx
+    return doc_idx, sample_idx, shuffle_idx, indices
 
 
 def _num_tokens(documents, sizes):

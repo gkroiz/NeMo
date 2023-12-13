@@ -14,6 +14,7 @@
 
 """Blendable dataset."""
 
+import os
 import time
 
 import numpy as np
@@ -45,12 +46,21 @@ class BlendableDataset(torch.utils.data.Dataset):
         self.dataset_sample_index = np.zeros(self.size, dtype=np.int64)
         app_state = AppState()
         try:
+            print('in blendable_dataset.py app_state.local_rank: ', app_state.local_rank, flush=True)
             if app_state.local_rank == 0:
                 from nemo.collections.nlp.data.language_modeling.megatron.dataset_utils import compile_helper
 
                 compile_helper()
-            torch.distributed.barrier()
+            sibling = os.environ.get("SIBLING")
+            if sibling != "younger":
+                # barrier will stall forever on younger VMs,
+                # so it is skipped and replaced by "time barrier"
+                torch.distributed.barrier()
+            else:
+                time.sleep(10)
+            print('in blendable_dataset.py before helpers import', flush=True)
             from nemo.collections.nlp.data.language_modeling.megatron import helpers
+            print('in blendable_dataset.py after helpers import', flush=True)
         except ImportError:
             raise ImportError(
                 f'Could not compile megatron dataset C++ helper functions and therefore cannot import helpers python file.'

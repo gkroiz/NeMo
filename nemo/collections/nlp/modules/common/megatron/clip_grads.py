@@ -69,7 +69,7 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
     Returns:
         Total norm of the parameters (viewed as a single vector).
     """
-
+    print('in clip_grads.py in clip_grad_norm_fp32', flush=True)
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
@@ -98,16 +98,18 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
     max_norm = float(max_norm)
     norm_type = float(norm_type)
     total_norm = 0.0
-
+    print('in clip_grads in clip_grad_norm_fp32 before calculate norm', flush=True)
     # Calculate norm.
     if norm_type == inf:
         if grads_for_norm:  # (@adithyare) grads_for_norm can be empty for adapter training with pp>1
             total_norm = max(grad.abs().max() for grad in grads_for_norm)
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
         # Take max across all model-parallel GPUs.
+        print('in clip_grads.py before all_reduce', flush=True)
         torch.distributed.all_reduce(
             total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=parallel_state.get_model_parallel_group()
         )
+        print('in clip_grads.py after all_reduce', flush=True)
         total_norm = total_norm_cuda[0].item()
 
     else:
@@ -135,9 +137,14 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
         total_norm_cuda = torch.cuda.FloatTensor(
             [float(total_norm)]
         )  # (@adithyare) total_norm can be a float at this point so we convert it to cuda.FloatTensor
-        torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=parallel_state.get_model_parallel_group()
-        )
+        rank = torch.distributed.get_rank()
+        print(f'rank {rank} | in clip_grads.py in clip_grad_norm_fp32 before all_reduce', flush=True)
+        # TODO (gersonkroiz): value of total_norm_cuda does not make sense here, is defined as such for functionality
+        for model_parallel_group in parallel_state.get_model_parallel_groups():
+            torch.distributed.all_reduce(
+                total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
+            )
+        print(f'rank {rank} | in clip_grads.py in clip_grad_norm_fp32 after all_reduce', flush=True)
         total_norm = total_norm_cuda[0].item()
         total_norm = total_norm ** (1.0 / norm_type)
 
@@ -209,6 +216,9 @@ def clip_grad_norm_distributed_optimizer(optimizer, max_norm, norm_type=2):
     # Compute grad norm
     # Note: DistributedFusedAdam caches grad norm to avoid redundant
     # communication.
+    print('in clip_grads.py before optimizer.grad_norm', flush=True)
     optimizer.grad_norm(parameters=params_for_norm, norm_type=norm_type)
+    print('in clip_grads.py after optimizer.grad_norm', flush=True)
 
+    print('in clip_grads.py after optimizer.clip_grad_norm', flush=True)
     return optimizer.clip_grad_norm(max_norm, norm_type=norm_type)

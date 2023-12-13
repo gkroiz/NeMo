@@ -195,7 +195,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
     Megatron GPT pretraining
     """
 
-    def __init__(self, cfg: DictConfig, trainer: Trainer):
+    def __init__(self, cfg: DictConfig, trainer: Trainer, sibling: str):
         if not HAVE_APEX:
             raise ImportError(
                 "Apex was not found. Please see the NeMo README for installation instructions: https://github.com/NVIDIA/NeMo#megatron-gpt."
@@ -285,6 +285,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         self.get_attention_mask_from_fusion = self.cfg.get('get_attention_mask_from_fusion', True)
         self.initialize_ub = self.cfg.get('ub_tp_comm_overlap', False)
         self.epoch_count = 0
+        self.sibling = sibling
+        self.optimizer_name = self.cfg.optim.get('name', None)
 
     def get_gpt_module_list(self):
         if isinstance(self.model, list):
@@ -441,10 +443,12 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 used_params.update(bucket)
             buckets[-1].extend(p for p in self.parameters() if p not in used_params)
             self.distributed_adam_buckets = buckets
+            print('in megatron_gpt_model.py self.distributed_adam_buckets: ', len(self.distributed_adam_buckets), flush=True)
 
         return super().configure_optimizers()
 
     def forward(self, tokens, text_position_ids, attention_mask, labels):
+        print('in megatron_gpt_model.py in forward', flush=True)
         output_tensor = self.model(tokens, text_position_ids, attention_mask, labels=labels)
         return output_tensor
 
@@ -1016,20 +1020,30 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         Args:
             stage (str, optional): Can be 'fit', 'validate', 'test' or 'predict'. Defaults to None.
         """
-        num_parameters_on_device, total_num_parameters = self._get_total_params_across_model_parallel_groups_gpt_bert(
-            self.model
-        )
-
+        print('in megatron_gpt_model.py, setup', flush=True)
+        print('in megatron_gpt_model.py before _get_total_params_across_model_parallel_groups_gpt_bert', flush=True)
         logging.info(
-            f'Pipeline model parallel rank: {parallel_state.get_pipeline_model_parallel_rank()}, '
-            f'Tensor model parallel rank: {parallel_state.get_tensor_model_parallel_rank()}, '
-            f'Number of model parameters on device: {num_parameters_on_device:.2e}. '
-            f'Total number of model parameters: {total_num_parameters:.2e}.'
+                f'Pipeline model parallel rank: {parallel_state.get_pipeline_model_parallel_rank()}, '
+                f'Tensor model parallel rank: {parallel_state.get_tensor_model_parallel_rank()}, '
         )
+        if self.sibling != "younger":
+            num_parameters_on_device, total_num_parameters = self._get_total_params_across_model_parallel_groups_gpt_bert(
+                self.model
+            )
 
+            logging.info(
+                f'Number of model parameters on device: {num_parameters_on_device:.2e}. '
+                f'Total number of model parameters: {total_num_parameters:.2e}.'
+            )
+            
+
+        print('in megatron_gpt_model.py before resume_checkpoint_path', flush=True)
         resume_checkpoint_path = self.trainer._checkpoint_connector.resume_from_checkpoint_fit_path
+        print('in megatron_gpt_model.py resume_checkpoint_path: ', resume_checkpoint_path, flush=True)
         if resume_checkpoint_path:
+            print('in megatron_gpt_model.py before _extract_consumed_samples_from_ckpt: ', resume_checkpoint_path, flush=True)
             init_consumed_samples = self._extract_consumed_samples_from_ckpt(resume_checkpoint_path)
+            print('in megatron_gpt_model.py after _extract_consumed_samples_from_ckpt: ', resume_checkpoint_path, flush=True)
         else:
             init_consumed_samples = 0
         self.init_consumed_samples = init_consumed_samples
@@ -1063,26 +1077,36 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         else:
             # TODO: consider adding a ModelPT guard to check if model is being restored.
             # allowing restored models to optionally setup datasets
+            print('in megatron_gpt_model.py before build_train_valid_test_datasets: ', flush=True)
             self.build_train_valid_test_datasets()
+            print('in megatron_gpt_model.py before setup_training_data: ', flush=True)
             self.setup_training_data(self.cfg.data)
+            print('in megatron_gpt_model.py before setup_validation_data: ', flush=True)
             self.setup_validation_data(self.cfg.data)
+            print('in megatron_gpt_model.py before setup_test_data: ', flush=True)
             self.setup_test_data(self.cfg.data)
 
         if stage == 'fit':
+            print('in megatron_gpt_model.py in stage == fit', flush=True)
             # when using pipeline model parallel the final stage need to initialize word embeddings
             if parallel_state.get_pipeline_model_parallel_world_size() > 1:
                 if isinstance(self.model, list):
                     for i, module in enumerate(self.model):
                         parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                         if self.cfg.get('share_embeddings_and_output_weights', True):
+                            print('in megatron_gpt_model.py before sync_initial_word_embeddings 1', flush=True)
                             module.sync_initial_word_embeddings()
+                            print('in megatron_gpt_model.py after sync_initial_word_embeddings 1', flush=True)
                     parallel_state.set_virtual_pipeline_model_parallel_rank(0)
                 else:
                     if self.cfg.get('share_embeddings_and_output_weights', True):
+                        print('in megatron_gpt_model.py before sync_initial_word_embeddings 2', flush=True)
                         self.model.sync_initial_word_embeddings()
+                        print('in megatron_gpt_model.py after sync_initial_word_embeddings 2', flush=True)
 
         if self.cfg.get('transformer_engine', False):
             self.setup_transformer_engine_tp_groups()
+        print('in megatron_gpt_model.py leaving setup', flush=True)
 
     def setup_training_data(self, cfg):
         if hasattr(self, '_train_ds'):
@@ -1345,105 +1369,383 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             for mod in module.modules():
                 if hasattr(mod, "sequence_parallel"):
                     mod.sequence_parallel = self.last_sequence_parallel
+                    
+    def _copy_model_weights(self, peer_rank: int, direction: str=["send, recv"]):
+        """ Copies/sends model weights."""
+        for name, param in self.model[0].named_parameters():
+            if direction == "send":
+                if "self_attention" in name:
+                    print(f'in megatron_gpt.model.py, in _copy_model_weights before send data to rank {peer_rank}, param.data: {param.data}', flush=True)
+                torch.distributed.send(param.data, peer_rank)
+            elif direction == "recv":
+                if "self_attention" in name:
+                    print(f'in megatron_gpt.model.py, in _copy_model_weights before recv data from rank {peer_rank}, param.data: {param.data}', flush=True)
+                recv_data = torch.empty_like(param)
+                torch.distributed.recv(recv_data, peer_rank)
+                param.data.copy_(recv_data)
+                if "self_attention" in name:
+                    print(f'in megatron_gpt.model.py, in _copy_model_weights after recv data from rank {peer_rank}, param.data: {param.data}', flush=True)
+                
+            else:
+                ValueError("direction must be defined as `send` or `recv`")
+                
 
-    def on_train_epoch_end(self):
-        # this function will switch the training strategy between 4-4-4 configuration to a 4-2-4 configuration after the third epoch (epoch 2).
+    def on_train_epoch_start(self):
+        # this function demonstrates scaling down VM count and then scaling up VM count
         # The values here are hardcoded, this will not work with other model configurations.
-        if self.epoch_count == 2:
-            if torch.distributed.is_initialized():
-                assert self.cfg.transformer_engine == False
-                assert self.cfg.fp8 == False
-                
-                world_size = torch.distributed.get_world_size()
-                rank = torch.distributed.get_rank()
+        print('in megatron_gpt_model.py in on_train_epoch_start', flush=True)
+        if self.sibling == "older":
+            # scale down block
+            if self.epoch_count == 3:
+                if torch.distributed.is_initialized():
+                    assert self.cfg.transformer_engine == False
+                    assert self.cfg.fp8 == False
+                    
+                    world_size = torch.distributed.get_world_size()
+                    rank = torch.distributed.get_rank()
 
-                # destroy existing process group
-                parallel_state.destroy_model_parallel()
-                torch.distributed.destroy_process_group()
+                    # destroy existing process group
+                    parallel_state.destroy_model_parallel()
+                    torch.distributed.destroy_process_group()
 
-                all_ranks = list(range(0,32)) + list(range(40,56)) + list(range(64,96))
-                if rank in list(range(32, 40)) or rank in list(range(56, 64)):
-                    print(f'exiting rank {rank}!', flush=True)
-                    exit(0)
+                    all_ranks = list(range(0,32)) + list(range(40,56)) + list(range(64,96))
+                    if rank in list(range(32, 40)) or rank in list(range(56, 64)):
+                        print(f'exiting rank {rank}!', flush=True)
+                        exit(0)
 
-                # create new process group
-                os.environ["MASTER_PORT"] = str(int(os.environ["MASTER_PORT"]) + 1)
-                print(f"Before Initializing distributed: GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
-                torch.distributed.init_process_group(backend="nccl", world_size=world_size-16, rank=all_ranks.index(rank))
-                world_size = torch.distributed.get_world_size()
-                rank = torch.distributed.get_rank()
-                print(f"After Initializing distributed: NEW GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
+                    # create new process group
+                    os.environ["MASTER_PORT"] = str(6003)
+                    print(f"rank {rank} scale down", flush=True)
+                    print(f"Before Initializing distributed: GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
+                    torch.distributed.init_process_group(backend="nccl", world_size=world_size-16, rank=all_ranks.index(rank))
+                    world_size = torch.distributed.get_world_size()
+                    rank = torch.distributed.get_rank()
+                    print(f"After Initializing distributed: NEW GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
+                    
+                    print('in megatron_gpt_model.py before barrier', flush=True)
+                    torch.distributed.barrier()
+                    print('in megatron_gpt_model.py before barrier', flush=True)
 
-                # test new process group
-                t = torch.tensor(1).to((rank % 8))
-                torch.distributed.all_reduce(t)
+                    # test new process group
+                    t = torch.tensor(1).to((rank % 8))
+                    torch.distributed.all_reduce(t)
 
-                # define new parallelization specs (4-2-4)
-                app_state = AppState()
+                    # define new parallelization specs (4-2-4)
+                    app_state = AppState()
 
-                parallelization_specs = {
-                    "stimulus": {
-                        "layers": [0],
-                        "gpu_ranks": list(range(0,32)),
-                        "gpus_per_node": 8,
-                        "data_parallel_group_size": 4,
-                        "tensor_model_parallel_group_size": 8,
-                        "pipeline_model_parallel_group_size": 1,
-                        },
-                    "test": {
-                        "layers": [1],
-                        "gpu_ranks": list(range(32,48)),
-                        "gpus_per_node": 8,
-                        "data_parallel_group_size": 2,
-                        "tensor_model_parallel_group_size": 8,
-                        "pipeline_model_parallel_group_size": 1,
-                        },
-                    "response": {
-                        "layers": [2],
-                        "gpu_ranks": list(range(48,80)),
-                        "gpus_per_node": 8,
-                        "data_parallel_group_size": 4,
-                        "tensor_model_parallel_group_size": 8,
-                        "pipeline_model_parallel_group_size": 1,
+                    parallelization_specs = {
+                        "stimulus": {
+                            "layers": [0],
+                            "gpu_ranks": list(range(0,32)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            },
+                        "test": {
+                            "layers": [1],
+                            "gpu_ranks": list(range(32,48)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 2,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            },
+                        "response": {
+                            "layers": [2],
+                            "gpu_ranks": list(range(48,80)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            }
                         }
-                    }
 
-                # create all new distributed process groups
-                parallel_state.initialize_model_components_parallel(
-                    parallelization_specs=parallelization_specs,
-                    virtual_pipeline_model_parallel_size=app_state.virtual_pipeline_model_parallel_size,
-                    pipeline_model_parallel_split_rank=app_state.pipeline_model_parallel_split_rank,
-                    use_fp8=app_state.use_fp8,
-                )
+                    # create all new distributed process groups
+                    parallel_state.initialize_model_components_parallel(
+                        parallelization_specs=parallelization_specs,
+                        virtual_pipeline_model_parallel_size=app_state.virtual_pipeline_model_parallel_size,
+                        pipeline_model_parallel_split_rank=app_state.pipeline_model_parallel_split_rank,
+                        use_fp8=app_state.use_fp8,
+                    )
 
-                # assert that fake tp, dp, and pp rank match after model parallel init
-                assert app_state.tensor_model_parallel_rank == parallel_state.get_tensor_model_parallel_rank()
-                assert app_state.pipeline_component_parallel_rank == parallel_state.get_pipeline_component_parallel_rank()
-                assert app_state.pipeline_model_parallel_rank == parallel_state.get_pipeline_model_parallel_rank()
+                    # assert that fake tp, dp, and pp rank match after model parallel init
+                    assert app_state.tensor_model_parallel_rank == parallel_state.get_tensor_model_parallel_rank()
+                    assert app_state.pipeline_component_parallel_rank == parallel_state.get_pipeline_component_parallel_rank()
+                    assert app_state.pipeline_model_parallel_rank == parallel_state.get_pipeline_model_parallel_rank()
 
-                app_state.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
-                app_state.data_parallel_group = parallel_state.get_data_parallel_group()
-                app_state.data_parallel_rank = parallel_state.get_data_parallel_rank()
-                app_state.data_parallel_size = parallel_state.get_data_parallel_world_size()
-                app_state.pipeline_component_parallel_group = parallel_state.get_pipeline_component_parallel_group()
-                app_state.pipeline_model_parallel_group = parallel_state.get_pipeline_model_parallel_group()
+                    app_state.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
+                    app_state.data_parallel_group = parallel_state.get_data_parallel_group()
+                    app_state.data_parallel_rank = parallel_state.get_data_parallel_rank()
+                    app_state.data_parallel_size = parallel_state.get_data_parallel_world_size()
+                    app_state.pipeline_component_parallel_group = parallel_state.get_pipeline_component_parallel_group()
+                    app_state.pipeline_model_parallel_group = parallel_state.get_pipeline_model_parallel_group()
+
+
+                    print(f'rank {rank} | in megatron_gpt_model.py optimizer.distributed_process_group before edits: ', self.trainer.optimizers[0].distributed_process_group, flush=True)
+                    print(f'rank {rank} | in megatron_gpt_model.py optimizer.process_group before edits: ', self.trainer.optimizers[0].process_group, flush=True)
+                    print(f'rank {rank} | in megatron_gpt_model.py self.trainer.optimizers before edits: ', hex(id(self.trainer.optimizers)), flush=True)
+                    # reset groups and vars in optimizer
+                    if self.optimizer_name == "distributed_fused_adam":
+                        self.trainer.strategy._custom_optimizer_setup(self.trainer)
+                    # else:
+                    
+                    # self.trainer.optimizers[0].process_group = parallel_state.get_data_parallel_group()
+                    # # self_groups = [torch.distributed.new_group(ranks=[i]) for i in range(world_size)]
+                    # # self.trainer.optimizers[0].distributed_process_group = self_groups[rank]
+                    # self.trainer.optimizers[0].distributed_process_group = self.trainer.optimizers[0].process_group
+                    # self.trainer.optimizers[0].redundant_process_group = self.trainer.optimizers[0].process_group
+                    # self.trainer.optimizers[0].process_group_size = torch.distributed.get_world_size(self.trainer.optimizers[0].process_group)
+                    # self.trainer.optimizers[0].distributed_rank = torch.distributed.get_rank(self.trainer.optimizers[0].distributed_process_group)
+                    # self.trainer.optimizers[0].distributed_size = torch.distributed.get_world_size(self.trainer.optimizers[0].distributed_process_group)
+                    # self.trainer.optimizers[0].redundant_size = torch.distributed.get_world_size(self.trainer.optimizers[0].redundant_process_group)
+                    # try:
+                    #     from torch.distributed.distributed_c10d import get_global_rank
+                    # except ImportError:
+                    #     from torch.distributed.distributed_c10d import _get_global_rank
+
+                    #     get_global_rank = _get_global_rank
+
+                    # self.trainer.optimizers[0].process_group_root = get_global_rank(self.trainer.optimizers[0].process_group, 0)
+
+                    print(f'rank {rank} | in megatron_gpt_model.py optimizer.distributed_process_group after edits: ', self.trainer.optimizers[0].distributed_process_group, flush=True)
+                    print(f'rank {rank} | in megatron_gpt_model.py optimizer.process_group after edits: ', self.trainer.optimizers[0].process_group, flush=True)
+                    print(f'rank {rank} | in megatron_gpt_model.py self.trainer.optimizers after edits: ', hex(id(self.trainer.optimizers)), flush=True)
+                    
+                    
+                    # print(f'rank {rank} | in megatron_gpt_model.py optimizer.distributed_process_group before edits: ', self.trainer.optimizers[0].distributed_process_group, flush=True)
+                    # print(f'rank {rank} | in megatron_gpt_model.py optimizer.process_group before edits: ', self.trainer.optimizers[0].process_group, flush=True)
+                    # print(f'rank {rank} | in megatron_gpt_model.py self.trainer.optimizers: ', self.trainer.optimizers, flush=True)
+                    # self.trainer.optimizers[0].process_group = parallel_state.get_data_parallel_group()
+                    # # self_groups = [torch.distributed.new_group(ranks=[i]) for i in range(world_size)]
+                    # # self.trainer.optimizers[0].distributed_process_group = self_groups[rank]
+                    # self.trainer.optimizers[0].distributed_process_group = self.trainer.optimizers[0].process_group
+                    # self.trainer.optimizers[0].redundant_process_group = self.trainer.optimizers[0].process_group
+                    # self.trainer.optimizers[0].process_group_size = torch.distributed.get_world_size(self.trainer.optimizers[0].process_group)
+                    # self.trainer.optimizers[0].distributed_rank = torch.distributed.get_rank(self.trainer.optimizers[0].distributed_process_group)
+                    # self.trainer.optimizers[0].distributed_size = torch.distributed.get_world_size(self.trainer.optimizers[0].distributed_process_group)
+                    # self.trainer.optimizers[0].redundant_size = torch.distributed.get_world_size(self.trainer.optimizers[0].redundant_process_group)
+                    # try:
+                    #     from torch.distributed.distributed_c10d import get_global_rank
+                    # except ImportError:
+                    #     from torch.distributed.distributed_c10d import _get_global_rank
+
+                    #     get_global_rank = _get_global_rank
+
+                    # self.trainer.optimizers[0].process_group_root = get_global_rank(self.trainer.optimizers[0].process_group, 0)
+
+                    # print(f'rank {rank} | in megatron_gpt_model.py optimizer.distributed_process_group after edits: ', self.trainer.optimizers[0].distributed_process_group, flush=True)
+                    # print(f'rank {rank} | in megatron_gpt_model.py optimizer.process_group after edits: ', self.trainer.optimizers[0].process_group, flush=True)
+
+            # scale up block
+            if self.epoch_count == 6:
+                if torch.distributed.is_initialized():
+                    assert self.cfg.transformer_engine == False
+                    assert self.cfg.fp8 == False
+
+                    world_size = torch.distributed.get_world_size()
+                    rank = torch.distributed.get_rank()
+
+                    # destroy existing process group
+                    parallel_state.destroy_model_parallel()
+                    torch.distributed.destroy_process_group()
+
+                    # create new process group
+                    os.environ["MASTER_PORT"] = str(6004)
+                    print(f"Before Initializing distributed: GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
+                    print(f"rank {rank} scale up", flush=True)
+
+                    if rank >= 48:
+                        rank += 8
+                    if rank >= 32:
+                        rank += 8
+
+
+                    torch.distributed.init_process_group(backend="nccl", world_size=world_size+16, rank=rank)
+                    world_size = torch.distributed.get_world_size()
+                    rank = torch.distributed.get_rank()
+                    print(f"After Initializing distributed: NEW GLOBAL_RANK: {rank}, MEMBER: {rank + 1}/{world_size}", flush=True)
+
+                    app_state = AppState()
+                    print("self.cfg.get(parallelization_specs): ", self.cfg.get('parallelization_specs'), flush=True)
+                    # create all new distributed process groups
+                    parallelization_specs = {
+                        "stimulus": {
+                            "layers": [0],
+                            "gpu_ranks": list(range(0,32)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            },
+                        "test": {
+                            "layers": [1],
+                            "gpu_ranks": list(range(32,64)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            },
+                        "response": {
+                            "layers": [2],
+                            "gpu_ranks": list(range(64,96)),
+                            "gpus_per_node": 8,
+                            "data_parallel_group_size": 4,
+                            "tensor_model_parallel_group_size": 8,
+                            "pipeline_model_parallel_group_size": 1,
+                            }
+                        }
+                    parallel_state.initialize_model_components_parallel(
+                        parallelization_specs=parallelization_specs,
+                        virtual_pipeline_model_parallel_size=app_state.virtual_pipeline_model_parallel_size,
+                        pipeline_model_parallel_split_rank=app_state.pipeline_model_parallel_split_rank,
+                        use_fp8=app_state.use_fp8,
+                    )
+
+                    # assert that fake tp, dp, and pp rank match after model parallel init
+                    assert app_state.tensor_model_parallel_rank == parallel_state.get_tensor_model_parallel_rank()
+                    assert app_state.pipeline_component_parallel_rank == parallel_state.get_pipeline_component_parallel_rank()
+                    assert app_state.pipeline_model_parallel_rank == parallel_state.get_pipeline_model_parallel_rank()
+
+                    app_state.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
+                    app_state.data_parallel_group = parallel_state.get_data_parallel_group()
+                    app_state.data_parallel_rank = parallel_state.get_data_parallel_rank()
+                    app_state.data_parallel_size = parallel_state.get_data_parallel_world_size()
+                    app_state.pipeline_component_parallel_group = parallel_state.get_pipeline_component_parallel_group()
+                    app_state.pipeline_model_parallel_group = parallel_state.get_pipeline_model_parallel_group()
+
+
+                    # create sibling group (need to create on all processes)
+                    ranks = list(range(32,40)) + list(range(56,64))
+                    sibling_group = torch.distributed.new_group(ranks=ranks)
+
+                    # setup new VM's profilers
+                    print('dir(self.trainer): ', dir(self.trainer), flush=True)
+                    print('in megatron_gpt_model.py before _Trainer__setup_profiler', flush=True)
+                    self.trainer._Trainer__setup_profiler()
+                    print('in megatron_gpt_model.py before _call_setup_hook', flush=True)
+                    # self.trainer._call_setup_hook()
+                    
+                    print('self._train_ds: ', self._train_ds, flush=True)
+                    print('self._train_ds.__dict__: ', self._train_ds.__dict__, flush=True)
+
+                    torch.distributed.broadcast_object_list(self._train_ds.datasets[0].indices)
+                    torch.distributed.broadcast_object_list(self._validation_ds.datasets[0].indices)
+                    torch.distributed.broadcast_object_list(self._test_ds.datasets[0].indices)
+
+                    # reset groups and vars in optimizer
+                    if self.optimizer_name == "distributed_fused_adam":
+                        self.trainer.strategy._custom_optimizer_setup(self.trainer)
+                    
+                    # print(f'rank {rank} | in megatron_gpt_model.py optimizer.distributed_process_group before edits: ', self.trainer.optimizers[0].distributed_process_group, flush=True)
+                    # print(f'rank {rank} | in megatron_gpt_model.py optimizer.process_group before edits: ', self.trainer.optimizers[0].process_group, flush=True)
+                    # print(f'rank {rank} | in megatron_gpt_model.py self.trainer.optimizers: ', self.trainer.optimizers, flush=True)
+                    
+                    
+                    # self.trainer.optimizers[0].process_group = parallel_state.get_data_parallel_group()
+                    # self_groups = [torch.distributed.new_group(ranks=[i]) for i in range(world_size)]
+                    # # self.trainer.optimizers[0].distributed_process_group = self_groups[rank]
+                    # self.trainer.optimizers[0].distributed_process_group = self.trainer.optimizers[0].process_group
+                    # self.trainer.optimizers[0].redundant_process_group = self.trainer.optimizers[0].process_group
+                    # self.trainer.optimizers[0].process_group_size = torch.distributed.get_world_size(self.trainer.optimizers[0].process_group)
+                    # self.trainer.optimizers[0].distributed_rank = torch.distributed.get_rank(self.trainer.optimizers[0].distributed_process_group)
+                    # self.trainer.optimizers[0].distributed_size = torch.distributed.get_world_size(self.trainer.optimizers[0].distributed_process_group)
+                    # self.trainer.optimizers[0].redundant_size = torch.distributed.get_world_size(self.trainer.optimizers[0].redundant_process_group)
+                    # try:
+                    #     from torch.distributed.distributed_c10d import get_global_rank
+                    # except ImportError:
+                    #     from torch.distributed.distributed_c10d import _get_global_rank
+
+                    #     get_global_rank = _get_global_rank
+
+                    # self.trainer.optimizers[0].process_group_root = get_global_rank(self.trainer.optimizers[0].process_group, 0)
+
+                    # # optimizer collectives
+                    # print('self.trainer.optimizers[0].__dict__: ', self.trainer.optimizers[0].__dict__, flush=True)
+                    # print('dir(self.trainer.optimizers[0]): ', dir(self.trainer.optimizers[0]), flush=True)
+                    # print('in megatron_gpt_model.py before broadcast_params', flush=True)
+                    # self.trainer.optimizers[0]._broadcast_params()
+                    # print('in megatron_gpt_model.py before _register_post_backward_hooks', flush=True)
+                    # self.trainer.optimizers[0]._register_post_backward_hooks()
+                    # print('in megatron_gpt_model.py before _register_pre_forward_hooks', flush=True)
+                    # self.trainer.optimizers[0]._register_pre_forward_hooks()
+                    # print('in megatron_gpt_model.py after _register_pre_forward_hooks', flush=True)
+
+
+
+
+                    # on fit start, comes after optimizer
+                    print('in megatron_gpt_model.py before _call_callback_hooks(on_fit_start)', flush=True)
+                    self.trainer._call_callback_hooks("on_fit_start")
+                    print('in megatron_gpt_model.py after _call_callback_hooks(on_fit_start)', flush=True)
+                    
+                    # resume training
+                    print('in megatron_gpt_model.py before _checkpoint_connector()', flush=True)
+                    self.trainer._checkpoint_connector.resume_end()
+                    print('in megatron_gpt_model.py after _checkpoint_connector()', flush=True)
+
+                    # add code here for synconrizing the model weights with older siblings
+                    import torch.distributed.distributed_c10d as c10d
+
+                    self.trainer.sibling_group = c10d._world.default_pg
+
+                    print(f'rank {rank} | in megatron_gpt_model.py self.model[0].module.language_model.encoder.layers[0].self_attention.dense.weight.data[0]: ', self.model[0].module.language_model.encoder.layers[0].self_attention.dense.weight.data[0], flush=True)
+
+                    if rank in list(range(40, 48)):
+                        self._copy_model_weights(rank - 8, "send")
+
+                        
+                    if rank in list(range(48, 56)):
+                        self._copy_model_weights(rank + 8, "send")
+                            
+
+                    print('in megatron_gpt_model.py after copying model weights', flush=True)
+                    print(f'rank {rank} | in megatron_gpt_model.py self.model[0].module.language_model.encoder.layers[0].self_attention.dense.weight.data[0]: ', self.model[0].module.language_model.encoder.layers[0].self_attention.dense.weight.data[0], flush=True)
+                    
+
+        if self.sibling == "younger" and self.epoch_count == 0:
+            print('in younger sibling', flush=True)
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            # reset groups and vars in optimizer
+            # self.trainer.optimizers[0].process_group = parallel_state.get_data_parallel_group()
+            # self_groups = [torch.distributed.new_group(ranks=[i]) for i in range(world_size)]
+            # self.trainer.optimizers[0].distributed_process_group = self_groups[rank]
+            # self.trainer.optimizers[0].redundant_process_group = parallel_state.get_data_parallel_group()
+            # self.trainer.optimizers[0].process_group_size = torch.distributed.get_world_size(self.trainer.optimizers[0].process_group)
+            # self.trainer.optimizers[0].distributed_rank = torch.distributed.get_rank(self.trainer.optimizers[0].distributed_process_group)
+            # self.trainer.optimizers[0].distributed_size = torch.distributed.get_world_size(self.trainer.optimizers[0].distributed_process_group)
+            # self.trainer.optimizers[0].redundant_size = torch.distributed.get_world_size(self.trainer.optimizers[0].redundant_process_group)
+            try:
+                from torch.distributed.distributed_c10d import get_global_rank
+            except ImportError:
+                from torch.distributed.distributed_c10d import _get_global_rank
+
+                get_global_rank = _get_global_rank
+
+            # self.trainer.optimizers[0].process_group_root = get_global_rank(self.trainer.optimizers[0].process_group, 0)
+
+            # add code here for syncronizing the model weights with younger siblings
+            import torch.distributed.distributed_c10d as c10d
+
+            self.trainer.sibling_group = c10d._world.default_pg
+            
+            # syncronize model weights
+            print(f'rank {rank} | in megatron_gpt_model.py self.model[0].module.language_model.encoder.layers[0].self_attention.dense.weight.data[0]: ', self.model[0].module.language_model.encoder.layers[0].self_attention.dense.weight.data[0], flush=True)
+            
+            if rank in list(range(32, 40)):
+                self._copy_model_weights(rank + 8, "recv")
+                    
                 
-                # reset groups and vars in optimizer
-                self.trainer.optimizers[0].process_group = parallel_state.get_data_parallel_group()
-                self_groups = [torch.distributed.new_group(ranks=[i]) for i in range(world_size)]
-                self.trainer.optimizers[0].distributed_process_group = self_groups[rank]
-                self.trainer.optimizers[0].redundant_process_group = parallel_state.get_data_parallel_group()
-                self.trainer.optimizers[0].process_group_size = torch.distributed.get_world_size(self.trainer.optimizers[0].process_group)
-                self.trainer.optimizers[0].distributed_rank = torch.distributed.get_rank(self.trainer.optimizers[0].distributed_process_group)
-                self.trainer.optimizers[0].distributed_size = torch.distributed.get_world_size(self.trainer.optimizers[0].distributed_process_group)
-                self.trainer.optimizers[0].redundant_size = torch.distributed.get_world_size(self.trainer.optimizers[0].redundant_process_group)
-                try:
-                    from torch.distributed.distributed_c10d import get_global_rank
-                except ImportError:
-                    from torch.distributed.distributed_c10d import _get_global_rank
+            if rank in list(range(56, 64)):
+                self._copy_model_weights(rank - 8, "recv")
+            
+            print('in megatron_gpt_model.py after copying model weights', flush=True)
+            print(f'rank {rank} | in megatron_gpt_model.py self.model[0].module.language_model.encoder.layers[0].self_attention.dense.weight.data[0]: ', self.model[0].module.language_model.encoder.layers[0].self_attention.dense.weight.data[0], flush=True)
 
-                    get_global_rank = _get_global_rank
 
-                self.trainer.optimizers[0].process_group_root = get_global_rank(self.trainer.optimizers[0].process_group, 0)
-
+        # epoch counter
         self.epoch_count += 1
+        print('in megatron_gpt_model.py leaving on_train_epoch_start, epoch_count = ', self.epoch_count, flush=True)
+
+        
+                    
