@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+from typing import Optional
 
 import pytest
 import torch
 from omegaconf import DictConfig, ListConfig
 
-from nemo.collections.asr.metrics.wer import CTCDecoding, CTCDecodingConfig
 from nemo.collections.asr.models import EncDecHybridRNNTCTCModel
 from nemo.collections.asr.modules import RNNTDecoder, RNNTJoint, SampledRNNTJoint, StatelessTransducerDecoder
 from nemo.collections.asr.parts.submodules import rnnt_beam_decoding as beam_decode
 from nemo.collections.asr.parts.submodules import rnnt_greedy_decoding as greedy_decode
+from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecoding, CTCDecodingConfig
 from nemo.collections.asr.parts.utils import rnnt_utils
 from nemo.core.utils import numba_utils
 from nemo.core.utils.numba_utils import __NUMBA_MINIMUM_VERSION__
@@ -230,7 +231,7 @@ class TestEncDecHybridRNNTCTCModel:
 
         assert hybrid_asr_model.ctc_decoding is not None
         assert isinstance(hybrid_asr_model.ctc_decoding, CTCDecoding)
-        assert hybrid_asr_model.ctc_decoding.cfg.strategy == "greedy"
+        assert hybrid_asr_model.ctc_decoding.cfg.strategy == "greedy_batched"
         assert hybrid_asr_model.ctc_decoding.preserve_alignments is False
         assert hybrid_asr_model.ctc_decoding.compute_timestamps is False
 
@@ -240,9 +241,31 @@ class TestEncDecHybridRNNTCTCModel:
         assert hybrid_asr_model.ctc_decoding.preserve_alignments is True
         assert hybrid_asr_model.ctc_decoding.compute_timestamps is True
 
+    @pytest.mark.skipif(
+        not NUMBA_RNNT_LOSS_AVAILABLE, reason='RNNTLoss has not been compiled with appropriate numba version.',
+    )
+    @pytest.mark.unit
+    def test_decoding_type_change(self, hybrid_asr_model):
+        assert isinstance(hybrid_asr_model.decoding.decoding, greedy_decode.GreedyBatchedRNNTInfer)
+
+        new_strategy = DictConfig({})
+        new_strategy.strategy = 'greedy'
+        new_strategy.greedy = DictConfig({'max_symbols': 10})
+        hybrid_asr_model.change_decoding_strategy(decoding_cfg=new_strategy, decoder_type='rnnt')
+        assert isinstance(hybrid_asr_model.decoding.decoding, greedy_decode.GreedyRNNTInfer)
+        assert hybrid_asr_model.cur_decoder == 'rnnt'
+
+        hybrid_asr_model.change_decoding_strategy(decoding_cfg=new_strategy, decoder_type='ctc')
+        assert isinstance(hybrid_asr_model.ctc_decoding, CTCDecoding)
+        assert hybrid_asr_model.cur_decoder == 'ctc'
+
+        hybrid_asr_model.change_decoding_strategy(decoding_cfg=new_strategy, decoder_type='rnnt')
+        assert isinstance(hybrid_asr_model.decoding.decoding, greedy_decode.GreedyRNNTInfer)
+        assert hybrid_asr_model.cur_decoder == 'rnnt'
+
     @pytest.mark.unit
     def test_GreedyRNNTInferConfig(self):
-        IGNORE_ARGS = ['decoder_model', 'joint_model', 'blank_index']
+        IGNORE_ARGS = ['decoder_model', 'joint_model', 'blank_index', 'tdt_include_duration_confidence']
 
         result = assert_dataclass_signature_match(
             greedy_decode.GreedyRNNTInfer, greedy_decode.GreedyRNNTInferConfig, ignore_args=IGNORE_ARGS
@@ -256,7 +279,7 @@ class TestEncDecHybridRNNTCTCModel:
 
     @pytest.mark.unit
     def test_GreedyBatchedRNNTInferConfig(self):
-        IGNORE_ARGS = ['decoder_model', 'joint_model', 'blank_index']
+        IGNORE_ARGS = ['decoder_model', 'joint_model', 'blank_index', 'tdt_include_duration_confidence']
 
         result = assert_dataclass_signature_match(
             greedy_decode.GreedyBatchedRNNTInfer, greedy_decode.GreedyBatchedRNNTInferConfig, ignore_args=IGNORE_ARGS
@@ -287,9 +310,14 @@ class TestEncDecHybridRNNTCTCModel:
     )
     @pytest.mark.unit
     @pytest.mark.parametrize(
-        "greedy_class", [greedy_decode.GreedyRNNTInfer, greedy_decode.GreedyBatchedRNNTInfer],
+        ("greedy_class", "loop_labels"),
+        [
+            (greedy_decode.GreedyRNNTInfer, None),
+            (greedy_decode.GreedyBatchedRNNTInfer, True),
+            (greedy_decode.GreedyBatchedRNNTInfer, False),
+        ],
     )
-    def test_greedy_decoding(self, greedy_class):
+    def test_greedy_decoding(self, greedy_class, loop_labels: Optional[bool]):
         token_list = [" ", "a", "b", "c"]
         vocab_size = len(token_list)
 
@@ -308,7 +336,10 @@ class TestEncDecHybridRNNTCTCModel:
         decoder = RNNTDecoder(prednet_cfg, vocab_size)
         joint_net = RNNTJoint(jointnet_cfg, vocab_size, vocabulary=token_list)
 
-        greedy = greedy_class(decoder, joint_net, blank_index=len(token_list) - 1, max_symbols_per_step=5)
+        additional_decoding_kwargs = {} if loop_labels is None else {"loop_labels": loop_labels}
+        greedy = greedy_class(
+            decoder, joint_net, blank_index=len(token_list) - 1, max_symbols_per_step=5, **additional_decoding_kwargs
+        )
 
         # (B, D, T)
         enc_out = torch.randn(1, encoder_output_size, 30)
@@ -359,9 +390,15 @@ class TestEncDecHybridRNNTCTCModel:
     )
     @pytest.mark.unit
     @pytest.mark.parametrize(
-        "greedy_class", [greedy_decode.GreedyRNNTInfer, greedy_decode.GreedyBatchedRNNTInfer],
+        ("greedy_class", "loop_labels"),
+        [
+            (greedy_decode.GreedyRNNTInfer, None),
+            (greedy_decode.GreedyBatchedRNNTInfer, True),
+            (greedy_decode.GreedyBatchedRNNTInfer, False),
+        ],
     )
-    def test_greedy_decoding_stateless_decoder(self, greedy_class):
+    @pytest.mark.parametrize("context_size", [1, 2])
+    def test_greedy_decoding_stateless_decoder(self, greedy_class, loop_labels: Optional[bool], context_size: int):
         token_list = [" ", "a", "b", "c"]
         vocab_size = len(token_list)
 
@@ -369,7 +406,7 @@ class TestEncDecHybridRNNTCTCModel:
         decoder_output_size = 4
         joint_output_shape = 4
 
-        prednet_cfg = {'pred_hidden': decoder_output_size, 'pred_rnn_layers': 1}
+        prednet_cfg = {'pred_hidden': decoder_output_size, 'pred_rnn_layers': 1, 'context_size': context_size}
         jointnet_cfg = {
             'encoder_hidden': encoder_output_size,
             'pred_hidden': decoder_output_size,
@@ -380,7 +417,10 @@ class TestEncDecHybridRNNTCTCModel:
         decoder = StatelessTransducerDecoder(prednet_cfg, vocab_size)
         joint_net = RNNTJoint(jointnet_cfg, vocab_size, vocabulary=token_list)
 
-        greedy = greedy_class(decoder, joint_net, blank_index=len(token_list) - 1, max_symbols_per_step=5)
+        additional_decoding_kwargs = {} if loop_labels is None else {"loop_labels": loop_labels}
+        greedy = greedy_class(
+            decoder, joint_net, blank_index=len(token_list) - 1, max_symbols_per_step=5, **additional_decoding_kwargs
+        )
 
         # (B, D, T)
         enc_out = torch.randn(1, encoder_output_size, 30)
@@ -431,9 +471,14 @@ class TestEncDecHybridRNNTCTCModel:
     )
     @pytest.mark.unit
     @pytest.mark.parametrize(
-        "greedy_class", [greedy_decode.GreedyRNNTInfer, greedy_decode.GreedyBatchedRNNTInfer],
+        ("greedy_class", "loop_labels"),
+        [
+            (greedy_decode.GreedyRNNTInfer, None),
+            (greedy_decode.GreedyBatchedRNNTInfer, True),
+            (greedy_decode.GreedyBatchedRNNTInfer, False),
+        ],
     )
-    def test_greedy_decoding_preserve_alignment(self, greedy_class):
+    def test_greedy_decoding_preserve_alignment(self, greedy_class, loop_labels: Optional[bool]):
         token_list = [" ", "a", "b", "c"]
         vocab_size = len(token_list)
 
@@ -452,8 +497,14 @@ class TestEncDecHybridRNNTCTCModel:
         decoder = RNNTDecoder(prednet_cfg, vocab_size)
         joint_net = RNNTJoint(jointnet_cfg, vocab_size, vocabulary=token_list)
 
+        additional_decoding_kwargs = {} if loop_labels is None else {"loop_labels": loop_labels}
         greedy = greedy_class(
-            decoder, joint_net, blank_index=len(token_list) - 1, preserve_alignments=True, max_symbols_per_step=5
+            decoder,
+            joint_net,
+            blank_index=len(token_list) - 1,
+            preserve_alignments=True,
+            max_symbols_per_step=5,
+            **additional_decoding_kwargs,
         )
 
         # (B, D, T)
@@ -569,9 +620,14 @@ class TestEncDecHybridRNNTCTCModel:
     )
     @pytest.mark.unit
     @pytest.mark.parametrize(
-        "greedy_class", [greedy_decode.GreedyRNNTInfer, greedy_decode.GreedyBatchedRNNTInfer],
+        ("greedy_class", "loop_labels"),
+        [
+            (greedy_decode.GreedyRNNTInfer, None),
+            (greedy_decode.GreedyBatchedRNNTInfer, True),
+            (greedy_decode.GreedyBatchedRNNTInfer, False),
+        ],
     )
-    def test_greedy_decoding_SampledRNNTJoint(self, greedy_class):
+    def test_greedy_decoding_SampledRNNTJoint(self, greedy_class, loop_labels: Optional[bool]):
         token_list = [" ", "a", "b", "c"]
         vocab_size = len(token_list)
 
@@ -590,7 +646,10 @@ class TestEncDecHybridRNNTCTCModel:
         decoder = RNNTDecoder(prednet_cfg, vocab_size)
         joint_net = SampledRNNTJoint(jointnet_cfg, vocab_size, n_samples=2, vocabulary=token_list)
 
-        greedy = greedy_class(decoder, joint_net, blank_index=len(token_list) - 1, max_symbols_per_step=5)
+        additional_decoding_kwargs = {} if loop_labels is None else {"loop_labels": loop_labels}
+        greedy = greedy_class(
+            decoder, joint_net, blank_index=len(token_list) - 1, max_symbols_per_step=5, **additional_decoding_kwargs
+        )
 
         # (B, D, T)
         enc_out = torch.randn(1, encoder_output_size, 30)

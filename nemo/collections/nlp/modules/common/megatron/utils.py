@@ -18,6 +18,11 @@ import math
 from typing import Dict, Iterator, List, Tuple, Union
 
 import torch
+import torch.nn as nn
+
+from torch import Tensor
+
+from nemo.utils import logging, logging_mode
 
 try:
     from apex.normalization import MixedFusedRMSNorm
@@ -41,6 +46,13 @@ try:
 except (ImportError, ModuleNotFoundError):
 
     HAVE_MEGATRON_CORE = False
+
+
+def ApproxGELUActivation(input: Tensor):
+    """
+    Applies GELU approximation that is fast but somewhat inaccurate. See: https://github.com/hendrycks/GELUs
+    """
+    return input * torch.sigmoid(1.702 * input)
 
 
 class ApexGuardDefaults(object):
@@ -71,7 +83,7 @@ def parallel_lm_logits(
         word_embeddings_weight (torch.Tensor): [(padded) vocab size, h]
         parallel_output (bool): False will gather logits from tensor model parallel region
         bias (torch.Tensor, optional): bias tensor. Defaults to None.
-        async_tensor_model_parallel_allreduce (bool, optional): TODO: understand this flag. Defaults to False.
+        async_tensor_model_parallel_allreduce (bool, optional): Defaults to False.
         sequence_parallel (bool, optional): If True will use sequence parallelism. Defaults to False.
         gradient_accumulation_fusioa (bool, optional): If True fuse gradient accumulation to WGRAD GEMM
 
@@ -98,7 +110,7 @@ def parallel_lm_logits(
         bias=bias,
         gradient_accumulation_fusion=gradient_accumulation_fusion,
         async_grad_allreduce=async_grad_allreduce,
-        sequence_parallel_enabled=sequence_parallel,
+        sequence_parallel=sequence_parallel,
     )
 
     # Gather if needed.
@@ -113,6 +125,13 @@ def init_method_normal(sigma):
 
     def init_(tensor):
         return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
+
+    return init_
+
+
+def init_method_kaiming_uniform(val):
+    def init_(tensor):
+        return torch.nn.init.kaiming_uniform_(tensor, a=val)
 
     return init_
 
@@ -158,6 +177,13 @@ def openai_gelu(x):
     return gelu_impl(x)
 
 
+try:
+    jit_fuser = torch.compile
+except:
+    jit_fuser = torch.jit.script
+
+
+@jit_fuser
 def squared_relu(x):
     return torch.pow(torch.nn.functional.relu(x), 2)
 
@@ -179,7 +205,9 @@ def average_losses_across_data_parallel_group(losses):
     return averaged_losses
 
 
-def get_ltor_masks_and_position_ids(data, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss):
+def get_ltor_masks_and_position_ids(
+    data, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss, compute_attention_mask=True
+):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
@@ -190,9 +218,12 @@ def get_ltor_masks_and_position_ids(data, eod_token, reset_position_ids, reset_a
         att_mask_batch = micro_batch_size
     else:
         att_mask_batch = 1
-    attention_mask = torch.tril(torch.ones((att_mask_batch, seq_length, seq_length), device=data.device)).view(
-        att_mask_batch, 1, seq_length, seq_length
-    )
+
+    attention_mask = None
+    if compute_attention_mask:
+        attention_mask = torch.tril(torch.ones((att_mask_batch, seq_length, seq_length), device=data.device)).view(
+            att_mask_batch, 1, seq_length, seq_length
+        )
 
     # Loss mask.
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
@@ -228,8 +259,9 @@ def get_ltor_masks_and_position_ids(data, eod_token, reset_position_ids, reset_a
                     position_ids[b, (i + 1) :] -= i + 1 - prev_index
                     prev_index = i + 1
 
-    # Convert attention mask to binary:
-    attention_mask = attention_mask < 0.5
+    if compute_attention_mask:
+        # Convert attention mask to binary:
+        attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
 
@@ -280,9 +312,7 @@ def make_inference_attention_mask_3d(source_block, target_block, pad_id):
 def make_inference_history_mask_3d(block):
     batch, length = block.shape
     arange = torch.arange(length, device=block.device)
-    history_mask = (arange[None,] <= arange[:, None])[
-        None,
-    ]
+    history_mask = (arange[None,] <= arange[:, None])[None,]
     history_mask = history_mask.expand(batch, length, length)
     return history_mask
 
@@ -336,23 +366,32 @@ def get_params_for_weight_decay_optimization(
     Layernorms and biases will have no weight decay but the rest will.
     """
     modules = listify_model(model)
-    weight_decay_params = {'params': []}
-    no_weight_decay_params = {'params': [], 'weight_decay': 0.0}
+    weight_decay_params = {'params': [], 'is_expert': False}
+    weight_decay_expert_params = {'params': [], 'is_expert': True}
+    no_weight_decay_params = {'params': [], 'weight_decay': 0.0, 'is_expert': False}
+    # EP params have the 'allreduce' attr set.
+    is_expert = lambda param: not getattr(param, 'allreduce', True)
+    # Do the actual param classification
     for module in modules:
         for module_ in module.modules():
             if isinstance(module_, (FusedLayerNorm, FastLayerNorm, MixedFusedRMSNorm)):
                 no_weight_decay_params['params'].extend(
-                    [p for p in list(module_._parameters.values()) if p is not None]
+                    list(filter(lambda p: p is not None, module_._parameters.values()))
                 )
             else:
-                weight_decay_params['params'].extend(
-                    [p for n, p in list(module_._parameters.items()) if p is not None and n != 'bias']
-                )
-                no_weight_decay_params['params'].extend(
-                    [p for n, p in list(module_._parameters.items()) if p is not None and n == 'bias']
-                )
+                for name, param in module_._parameters.items():
+                    if param is None:
+                        continue
+                    if name.endswith('bias'):
+                        no_weight_decay_params['params'].extend([param])
+                    else:
+                        if is_expert(param):
+                            weight_decay_expert_params['params'].extend([param])
+                        else:
+                            weight_decay_params['params'].extend([param])
 
-    return weight_decay_params, no_weight_decay_params
+    param_groups = [weight_decay_params, weight_decay_expert_params, no_weight_decay_params]
+    return tuple(filter(lambda g: len(g['params']) > 0, param_groups))
 
 
 def get_all_params_for_weight_decay_optimization(
@@ -361,23 +400,88 @@ def get_all_params_for_weight_decay_optimization(
     """Use all params for weight decay."""
     modules = listify_model(model)
 
-    weight_decay_params = [
-        p for module in modules for module_ in module.modules() for p in module_._parameters.values() if p is not None
-    ]
+    weight_decay_params = {'params': [], 'is_expert': False}
+    weight_decay_expert_params = {'params': [], 'is_expert': True}
 
-    return ({'params': weight_decay_params},)
+    # populate with params
+    is_expert = lambda param: not getattr(param, 'allreduce', True)
+    for module in modules:
+        weight_decay_params['params'] += list(filter(lambda x: not is_expert(x), module.parameters()))
+        weight_decay_expert_params['params'] += list(filter(is_expert, module.parameters()))
+
+    param_groups = [weight_decay_params, weight_decay_expert_params]
+    return tuple(filter(lambda g: len(g['params']) > 0, param_groups))
 
 
-def get_iterator_k_split(batch: List[torch.Tensor], num_microbatches: int) -> Iterator:
+def split_list(inputs, num_chunks):
+    """
+    Split a list into equal sized chunks
+    """
+    chunk_size = len(inputs) // num_chunks
+    assert len(inputs) % chunk_size == 0, "Issue with batch size configuration!"
+    return [inputs[i : i + chunk_size] for i in range(0, len(inputs), chunk_size)]
+
+
+def get_iterator_k_split(batch: Union[Dict, List[torch.Tensor]], num_microbatches: int) -> Iterator:
+    """
+    Split a batch into k microbatches, where the batch size is divisible by k. Batch could be
+    a dictionary of tensors or a list of tensors. A dictionary batch could also have items of List type,
+    as long as the length of that list is the same as the batch size.
+    """
     if isinstance(batch, dict):
-        items = list(batch.items())
+        discard_items = [k for k, v in batch.items() if not isinstance(v, (torch.Tensor, list))]
+        if len(discard_items) > 0:
+            logging.warning(
+                f"Only support splitting torch.Tensor and List[torch.Tensor]. Discarding the following keys from the batch: {discard_items}",
+                mode=logging_mode.ONCE,
+            )
+
+        batch = {k: v for k, v in batch.items() if isinstance(v, (torch.Tensor, list))}
+        tensor_items = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        list_items = {k: v for k, v in batch.items() if isinstance(v, list)}
+
+        # Split tensor items
+        items = list(tensor_items.items())
         assert items[0][1].shape[0] % num_microbatches == 0, "Issue with batch size configuration!"
         split_batch = [torch.tensor_split(item[1], num_microbatches, dim=0) for item in items]
-        microbatches = [[(items[i][0], split_batch[i][j]) for i in range(len(items))] for j in range(num_microbatches)]
+
+        if len(list_items) == 0:
+            # Only have tensor items
+            microbatches = [
+                [(items[i][0], split_batch[i][j]) for i in range(len(items))] for j in range(num_microbatches)
+            ]
+        else:
+            # Split list items
+            list_items = list(list_items.items())
+            split_list_batch = [split_list(item[1], num_microbatches) for item in list_items]
+            # Merge tensor and list items
+            all_keys = [item[0] for item in items] + [item[0] for item in list_items]
+            all_split_batch = split_batch + split_list_batch
+            microbatches = [
+                [(all_keys[i], all_split_batch[i][j]) for i in range(len(all_keys))] for j in range(num_microbatches)
+            ]
         microbatches = [dict(elem) for elem in microbatches]
     else:
+        # Split a list of torch tensors
         assert batch[0].shape[0] % num_microbatches == 0, "Issue with batch size configuration!"
-        split_batch = [torch.tensor_split(item, num_microbatches, dim=0) for item in batch]
-        microbatches = [[elem[i] for elem in split_batch] for i in range(num_microbatches)]
+        split_batch = [
+            torch.tensor_split(item, num_microbatches, dim=0) if torch.is_tensor(item) else item for item in batch
+        ]
+        microbatches = [
+            [elem[i] if elem is not None else elem for elem in split_batch] for i in range(num_microbatches)
+        ]
 
     return itertools.chain(microbatches)
+
+
+def _cast_if_autocast_enabled(tensor):
+    if torch.is_autocast_enabled():
+        if isinstance(tensor, torch.Tensor):
+            if tensor.device.type == 'cuda':
+                dtype = torch.get_autocast_gpu_dtype()
+            elif tensor.device.type == 'cpu':
+                dtype = torch.get_autocast_cpu_dtype()
+            else:
+                raise NotImplementedError()
+            return tensor.to(dtype=dtype)
+    return tensor

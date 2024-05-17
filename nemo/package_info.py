@@ -13,10 +13,14 @@
 # limitations under the License.
 
 
-MAJOR = 1
-MINOR = 19
+MAJOR = 2
+MINOR = 0
 PATCH = 0
+<<<<<<< HEAD
 PRE_RELEASE = ''
+=======
+PRE_RELEASE = 'rc1'
+>>>>>>> upstream/main
 
 # Use the following formatting: (major, minor, patch, pre-release)
 VERSION = (MAJOR, MINOR, PATCH, PRE_RELEASE)
