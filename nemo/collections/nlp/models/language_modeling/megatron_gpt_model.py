@@ -764,6 +764,12 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         The input batch to each micro-batch is fetched using the dataloader function
         in the micro-batch fwd function.
         """
+
+        if hasattr(self, 'goodput_recorder'):
+            # Record the start time of the step
+            logging.info(f"Recording step start time for global step {self.trainer.global_step}")
+            self.goodput_recorder.record_step_start_time(self.trainer.global_step)
+
         # Initialize userbuffer communicators.
         if self.initialize_ub:
             self.initialize_ub_func()

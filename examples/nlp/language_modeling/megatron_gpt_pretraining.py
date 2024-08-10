@@ -13,7 +13,9 @@
 # limitations under the License.
 
 
+import os
 from pathlib import Path
+import time
 
 # To suppress BF16 compile related issue in the CI runs with turing/V100
 import torch._dynamo
@@ -27,6 +29,8 @@ from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 
+from ml_goodput_measurement import goodput
+
 torch._dynamo.config.suppress_errors = True
 
 mp.set_start_method("spawn", force=True)
@@ -34,6 +38,17 @@ mp.set_start_method("spawn", force=True)
 
 @hydra_runner(config_path="conf", config_name="megatron_gpt_config")
 def main(cfg) -> None:
+    # Define goodput_recorder
+    logging.info(f"Rank: {os.environ['RANK']}")
+    goodput_logger_name = f'goodput_{cfg.run.name}'
+    goodput_recorder = goodput.GoodputRecorder(job_name=cfg.run.name, logger_name=goodput_logger_name, logging_enabled=(int(os.environ["RANK"]) == 0))
+
+    # Record job start time
+    goodput_recorder.record_job_start_time()
+
+    # Record training preparation start time
+    goodput_recorder.record_training_preparation_start_time()
+
     logging.info("\n\n************** Experiment configuration ***********")
     logging.info(f'\n{OmegaConf.to_yaml(cfg)}')
 
@@ -60,7 +75,23 @@ def main(cfg) -> None:
     else:
         model = MegatronGPTModel(cfg.model, trainer)
 
+    model.goodput_recorder = goodput_recorder
+
+    # Record training preparation end time
+    goodput_recorder.record_training_preparation_end_time()
+
     trainer.fit(model)
+
+    # Record job end time
+    goodput_recorder.record_job_end_time()
+
+    time.sleep(15)
+
+    # Calculate and log the total job goodput
+    goodput_calculator = goodput.GoodputCalculator(job_name=cfg.run.name, logger_name=goodput_logger_name)
+    total_goodput = goodput_calculator.get_job_goodput()
+
+    logging.info(f"Total job goodput: {total_goodput}%")
 
 
 if __name__ == '__main__':
