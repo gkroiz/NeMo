@@ -14,11 +14,12 @@
 
 
 from pathlib import Path
+import os
 
 # To suppress BF16 compile related issue in the CI runs with turing/V100
 import torch._dynamo
 import torch.multiprocessing as mp
-from omegaconf.omegaconf import OmegaConf, open_dict
+from omegaconf.omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from nemo.collections.nlp.parts.megatron_trainer_builder import MegatronTrainerBuilder
@@ -29,11 +30,10 @@ from nemo.utils.exp_manager import exp_manager
 
 torch._dynamo.config.suppress_errors = True
 
-mp.set_start_method("spawn", force=True)
 
-
-@hydra_runner(config_path="conf", config_name="megatron_gpt_config")
-def main(cfg) -> None:
+def main(global_rank: int, world_size: int, cfg: DictConfig=None) -> None:
+    if cfg is None:
+        cfg = OmegaConf.load(os.environ.get("CONFIG_FILE", "conf/megatron_gpt_config.yaml"))
     logging.info("\n\n************** Experiment configuration ***********")
     logging.info(f'\n{OmegaConf.to_yaml(cfg)}')
 
@@ -64,4 +64,6 @@ def main(cfg) -> None:
 
 
 if __name__ == '__main__':
+    mp.set_start_method("spawn", force=True)
     main()
+    
